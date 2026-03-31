@@ -1,16 +1,11 @@
-from math_verify.grader import verify as math_verify_grader
 from math_verify.metric import math_metric
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
-from math_verify.parser import parse as math_verify_parse
 
 from areal.utils import logging
 
 logger = logging.getLogger("RewardUtils")
 
 VALID_REWARD_FN = ["clevr_count_70k", "geometry3k"]
-_THREADED_ENV_ERROR = (
-    "Math-Verify 'parse' function doesn't support threaded environment"
-)
 
 
 def get_custom_reward_fn(path: str, **kwargs):
@@ -43,51 +38,28 @@ class MathVerifyWorker:
     """
 
     def __init__(self, try_extract_without_anchor=True, precision: int = 6):
-        self.precision = precision
-        self.gold_extraction_target = (
-            ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
-            LatexExtractionConfig(),
-        )
-        self.pred_extraction_target = (
-            ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
-            LatexExtractionConfig(),
-        )
         self.verify_func = math_metric(
-            gold_extraction_target=self.gold_extraction_target,
-            pred_extraction_target=self.pred_extraction_target,
-            precision=self.precision,
+            gold_extraction_target=(
+                ExprExtractionConfig(
+                    try_extract_without_anchor=try_extract_without_anchor
+                ),
+                LatexExtractionConfig(),
+            ),
+            pred_extraction_target=(
+                ExprExtractionConfig(
+                    try_extract_without_anchor=try_extract_without_anchor
+                ),
+                LatexExtractionConfig(),
+            ),
+            precision=precision,
         )
-
-    def _verify_without_timeout(self, response: str, ground_truth: str) -> float:
-        extracted_predictions = math_verify_parse(
-            response,
-            self.pred_extraction_target,
-            parsing_timeout=None,
-        )
-        extracted_golds = math_verify_parse(
-            ground_truth,
-            self.gold_extraction_target,
-            parsing_timeout=None,
-        )
-        if not extracted_golds or not extracted_predictions:
-            return 0.0
-        matched = any(
-            math_verify_grader(
-                gold, pred, float_rounding=self.precision, timeout_seconds=None
-            )
-            for gold in extracted_golds
-            for pred in extracted_predictions
-        )
-        return 1.0 if matched else 0.0
 
     def verify(self, response: str, ground_truth: str) -> float:
         # ground_truth_parsable = "\\boxed{" + ground_truth + "}"
         try:
             ret_score, _ = self.verify_func([ground_truth], [response])
             return float(ret_score)
-        except Exception as exc:
-            if _THREADED_ENV_ERROR in str(exc):
-                return self._verify_without_timeout(response, ground_truth)
+        except Exception:
             logger.warning(
                 f"Exception in MathVerifyWorker.verify for response={response} and ground_truth={ground_truth}",
                 exc_info=True,

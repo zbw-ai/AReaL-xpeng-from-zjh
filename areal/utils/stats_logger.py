@@ -12,7 +12,6 @@ from areal.api import FinetuneSpec
 from areal.api.cli_args import BaseExperimentConfig, StatsLoggerConfig
 from areal.utils import logging
 from areal.utils.printing import tabulate_stats
-from areal.utils.tracking_patch import apply_metric_mapping
 from areal.version import version_info
 
 logger = logging.getLogger("StatsLogger", "system")
@@ -129,8 +128,6 @@ class StatsLogger:
         for i, item in enumerate(data):
             # Filter out counter keys for scalar variables
             item = {k: v for k, v in item.items() if not k.endswith("__count")}
-            # Add DeepInsight-renamed metrics for SwanLab compatibility
-            apply_metric_mapping(item)
 
             logger.info(f"Stats ({i + 1}/{len(data)}):")
             self.print_stats(item)
