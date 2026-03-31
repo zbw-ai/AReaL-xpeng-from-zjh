@@ -6,6 +6,7 @@
 # claude
 .claude/settings.local.json
 .claude/sessions/
+.claude/skills/flowchart/
 .agent/
 
 # Codex repo-local skills live in `.agents/skills/`.
@@ -203,3 +204,13 @@ wandb/
 outputs/
 sympy/
 !/docs/figures/*
+
+# Fuyao local artifacts
+.shim/
+areal/_stubs/
+local_git_sha.txt
+upstream_*.patch
+upstream_*.txt
+draft_*.dockerfile
+docs/gen_flowchart_*.py
+docs/*_flowchart.png

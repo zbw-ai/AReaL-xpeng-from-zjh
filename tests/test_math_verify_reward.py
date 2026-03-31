@@ -1,3 +1,5 @@
+import threading
+
 from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_reward_fn
 
 
@@ -760,3 +762,18 @@ class TestMathVerifyWorkerTextWrappedAnswers:
         pred = "Result: \\boxed{(1/2)^{2} + \\sqrt{9}}"
         gold = "answer is 0.25 + 3"
         assert worker.verify(pred, gold) == 1.0
+
+
+class TestMathVerifyWorkerThreadedVerification:
+    def test_worker_verify_in_thread_uses_timeout_free_fallback(self):
+        worker = get_math_verify_worker()
+        result = {}
+
+        def _run():
+            result["score"] = worker.verify("The final answer is \\boxed{12}.", "12")
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join()
+
+        assert result["score"] == 1.0

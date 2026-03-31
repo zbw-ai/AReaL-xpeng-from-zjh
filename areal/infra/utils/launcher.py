@@ -160,7 +160,13 @@ def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
 
     dynamic_pythonpath = os.pathsep.join(pythonpath_parts)
 
-    return {**BASE_ENVIRONS, "PYTHONPATH": dynamic_pythonpath, **_additional_env_vars}
+    # Inherit parent environment, then override with AReaL-specific vars
+    return {
+        **os.environ,
+        **BASE_ENVIRONS,
+        "PYTHONPATH": dynamic_pythonpath,
+        **_additional_env_vars,
+    }
 
 
 class JobState(enum.Enum):

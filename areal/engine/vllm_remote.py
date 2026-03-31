@@ -42,6 +42,7 @@ class VLLMBackend:
         """Build vLLM generation request."""
         gconfig = req.gconfig
         stop_token_ids = gconfig.stop_token_ids
+        stop = gconfig.stop
 
         # NOTE: vLLM uses flat payload structure, not nested sampling_params
         payload = {
@@ -50,6 +51,7 @@ class VLLMBackend:
             "max_tokens": gconfig.max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
+            "frequency_penalty": gconfig.frequency_penalty,
             "ignore_eos": gconfig.ignore_eos,
             "skip_special_tokens": gconfig.skip_special_tokens,
             "return_tokens_as_token_ids": True,
@@ -57,6 +59,8 @@ class VLLMBackend:
             "use_beam_search": gconfig.use_beam_search,
             "stream": False,
         }
+        if stop:
+            payload["stop"] = stop
 
         if with_lora:
             lora_name = gconfig.lora_name
