@@ -38,9 +38,16 @@ MAX_OUTPUT_CHARS = 1024
 
 
 def _extract_code(text: str) -> str | None:
-    """Extract Python code from <code>...</code>."""
+    """Extract Python code from <code>...</code> or <code>... (unclosed, stopped by stop_strings)."""
     m = CODE_TAG_PATTERN.search(text)
-    return m.group(1).strip() if m else None
+    if m:
+        return m.group(1).strip()
+    # Handle unclosed <code> tag (SGLang/vLLM stop_strings strips the closing tag)
+    open_idx = text.rfind("<code>")
+    if open_idx != -1:
+        code = text[open_idx + len("<code>"):]
+        return code.strip() if code.strip() else None
+    return None
 
 
 def _extract_boxed_answer(text: str) -> str | None:

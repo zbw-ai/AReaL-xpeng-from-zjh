@@ -31,9 +31,16 @@ ANSWER_TAG_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
 
 
 def _extract_search_query(text: str) -> str | None:
-    """Extract query from <search>query</search>."""
+    """Extract query from <search>query</search> or <search>query (unclosed, stopped by stop_strings)."""
     m = SEARCH_TAG_PATTERN.search(text)
-    return m.group(1).strip() if m else None
+    if m:
+        return m.group(1).strip()
+    # Handle unclosed <search> tag (stop_strings strips the closing tag)
+    open_idx = text.rfind("<search>")
+    if open_idx != -1:
+        query = text[open_idx + len("<search>"):]
+        return query.strip() if query.strip() else None
+    return None
 
 
 def _extract_answer(text: str) -> str | None:
@@ -128,17 +135,23 @@ class SearchR1Workflow(RolloutWorkflow):
         self, engine: InferenceEngine, data: dict
     ) -> dict[str, torch.Tensor] | None:
         """Multi-turn generate-retrieve loop."""
-        # Extract question and golden answers
-        question = data.get("question", data.get("problem", ""))
+        # Extract golden answers
         golden_answers = data.get("golden_answers", data.get("answer", ""))
         if isinstance(golden_answers, str):
             golden_answers = [golden_answers]
 
-        # Build initial prompt
+        # Build initial prompt — use data's original prompt if available
         messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": question})
+        prompt_field = data.get("prompt")
+        if prompt_field and isinstance(prompt_field, list):
+            # Data has pre-built messages (e.g., nq_search with full instructions)
+            messages = list(prompt_field)
+        else:
+            # Fallback: build from question
+            question = data.get("question", data.get("problem", ""))
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": question})
 
         # Track all tokens for the full trajectory
         all_input_ids: list[int] = []
@@ -225,7 +238,7 @@ class SearchR1Workflow(RolloutWorkflow):
                     tool_use_success += 1
 
                 # Append retrieval result to conversation
-                result_text = f"\n<result>\n{retrieval_result}\n</result>\n"
+                result_text = f"\n<information>\n{retrieval_result}\n</information>\n"
                 result_tokens = self.tokenizer.encode(result_text, add_special_tokens=False)
 
                 # Result tokens are NOT trainable (loss_mask=0)

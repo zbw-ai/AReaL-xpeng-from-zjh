@@ -109,6 +109,9 @@ done
 # ========================== 5. 环境配置 ==========================
 echo "===== Step 2: Configure environment ====="
 
+# 生成时间戳，用于 experiment_name 去重
+export AREAL_RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
 # NCCL 配置
 unset NCCL_NET_GDR_LEVEL 2>/dev/null || true
 export NCCL_IB_QPS_PER_CONNECTION=8
@@ -120,13 +123,10 @@ export NCCL_MAX_NCHANNELS=16
 
 # CUDA 配置
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Python 配置
-# Include sglang from system install; disable sgl_kernel if A100 (sm80, no sm80 kernel)
-EXTRA_PATHS="${PROJECT_ROOT}/areal/_stubs"
-[[ -d "/sgl-workspace/sglang/python" ]] && EXTRA_PATHS="${EXTRA_PATHS}:/sgl-workspace/sglang/python"
-export PYTHONPATH="${PROJECT_ROOT}:${EXTRA_PATHS}:${PYTHONPATH:-}"
-export SGLANG_KERNEL_DISABLE=1
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
 # SwanLab
@@ -217,17 +217,7 @@ cd "$PROJECT_ROOT"
 
 python3 "${LAUNCH_SCRIPT}" \
     --config "${CONFIG_PATH}" \
-    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" &
-TRAIN_PID=$!
-echo "$TRAIN_PID" > "${RUN_STATE_DIR}/${RUN_TYPE}.pid"
+    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; exit_code=$?
 
-cleanup() {
-    if [[ -n "${TRAIN_PID:-}" ]] && kill -0 "${TRAIN_PID}" 2>/dev/null; then
-        kill "${TRAIN_PID}" 2>/dev/null || true
-        wait "${TRAIN_PID}" 2>/dev/null || true
-    fi
-    rm -f "${RUN_STATE_DIR}/${RUN_TYPE}.pid"
-}
-
-trap cleanup EXIT INT TERM
-wait "${TRAIN_PID}"
+echo "Training finished with exit code: ${exit_code}"
+exit ${exit_code}

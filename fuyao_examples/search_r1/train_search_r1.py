@@ -37,11 +37,15 @@ def load_search_dataset(path: str, question_key: str, answer_key: str, split: st
     else:
         ds = load_dataset(path, split=split)
 
-    # Normalize column names
+    # Normalize column names, preserve prompt if available
     def normalize(sample):
         question = sample.get(question_key, "")
         answer = sample.get(answer_key, "")
-        return {"question": question, "golden_answers": answer}
+        result = {"question": question, "golden_answers": answer}
+        # Keep original prompt field (contains full instructions for search)
+        if "prompt" in sample and sample["prompt"]:
+            result["prompt"] = sample["prompt"]
+        return result
 
     ds = ds.map(normalize)
     return ds

@@ -9,7 +9,7 @@
 #       --run-type code_dapo \
 #       --config fuyao_examples/code_dapo/code_dapo_qwen3_4b.yaml
 
-experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-code-dapo
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-code-dapo-${oc.env:AREAL_RUN_TIMESTAMP,0}
 trial_name: trial0
 
 seed: 42
@@ -24,15 +24,21 @@ code_timeout: 10
 max_turns: 10
 max_tool_uses: 5
 max_total_tokens: 8192
-system_prompt: "Please reason step by step, and put your final answer within '\\boxed{}', e.g. \\boxed{A}."
+system_prompt: >-
+  Please reason step by step, and put your final answer within '\boxed{}', e.g. \boxed{A}.
+  You have the capability to write code to use the code interpreter for calculation.
+  The code will be executed by a sandbox, and the result can be returned to enhance your reasoning process.
+  Each code snippet is wrapped with: <code>...</code>, and should be executable.
+  The code snippets should be complete scripts, including necessary imports.
+  Outputs in the code snippets must explicitly call the print function.
 
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/files
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/name_resolve
 
 scheduler:
   type: local
@@ -69,7 +75,7 @@ actor:
   backend: "megatron:d4t1p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /publicdata/huggingface.co/Qwen/Qwen3-4B
+  path: /publicdata/huggingface.co/Qwen/Qwen3-4B  # ← model path
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -95,6 +101,9 @@ actor:
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 5.0
+  reward_norm:
+    mean_level: batch
+    std_level: batch
   adv_norm:
     mean_level: batch
     std_level: batch
@@ -146,14 +155,14 @@ train_dataset:
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
   type: dapo_math
 
 valid_dataset:
   batch_size: 128
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
   type: dapo_math
 
 # ── Utilities ──

@@ -43,13 +43,15 @@ def apply_tracking_patch():
 
     original_commit = StatsLogger.commit
 
-    def patched_commit(self, *args, **kwargs):
-        # Intercept the data before committing
-        if args and isinstance(args[0], list):
-            for item in args[0]:
+    def patched_commit(self, epoch, step, global_step, data):
+        # Intercept data before committing to add DeepInsight metrics
+        if isinstance(data, dict):
+            _add_deepinsight_metrics(data)
+        elif isinstance(data, list):
+            for item in data:
                 if isinstance(item, dict):
                     _add_deepinsight_metrics(item)
-        return original_commit(self, *args, **kwargs)
+        return original_commit(self, epoch, step, global_step, data)
 
     StatsLogger.commit = patched_commit
     logger.info("Applied DeepInsight metric mapping patch to StatsLogger")

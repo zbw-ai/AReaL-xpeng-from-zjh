@@ -10,7 +10,7 @@
 #       --run-type math_rlvr \
 #       --config fuyao_examples/math/qwen3_4b_rlvr.yaml
 
-experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-math-rlvr
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-math-rlvr-${oc.env:AREAL_RUN_TIMESTAMP,0}
 trial_name: trial0
 
 seed: 42
@@ -21,10 +21,10 @@ tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /tmp/areal/experiments
+  fileroot: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/files
   name_resolve:
     type: nfs
-    nfs_record_root: /tmp/areal/name_resolve
+    nfs_record_root: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/name_resolve
 
 scheduler:
   type: local
@@ -59,7 +59,7 @@ actor:
   backend: "megatron:d4t1p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /publicdata/huggingface.co/Qwen/Qwen3-4B
+  path: /publicdata/huggingface.co/Qwen/Qwen3-4B  # ← model path
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -136,18 +136,18 @@ sglang:
 
 # ── Datasets — dapo_math_17k ──
 train_dataset:
-  batch_size: 128
+  batch_size: 16
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
   type: dapo_math
 
 valid_dataset:
-  batch_size: 128
+  batch_size: 16
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
   type: dapo_math
 
 # ── Utilities ──

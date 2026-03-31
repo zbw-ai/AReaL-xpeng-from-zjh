@@ -25,7 +25,7 @@ def main(args):
     )
     valid_dataset = get_dapo_math_rl_dataset(
         path=config.valid_dataset.path,
-        split="train",
+        split="valid",
         tokenizer=tokenizer,
     )
 
