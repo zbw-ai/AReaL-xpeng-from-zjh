@@ -1,4 +1,8 @@
-# CLAUDE.md - AReaL
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+# AReaL
 
 ## WHAT: Project Overview
 
@@ -25,11 +29,43 @@ learning.
 - `examples/` - Training scripts and configs
 - `docs/` - Jupyter Book source
 
-## WHY: Purpose
+## Architecture: Execution Flow
 
-- Enable efficient RL training for LLM alignment at scale
-- Async rollout + distributed training for high throughput
-- Modular design: workflows, engines, rewards, and datasets are independently extensible
+Understanding how the layers connect requires reading multiple files:
+
+```
+Entry point (e.g. examples/math/gsm8k_rl.py)
+  ├── load_expr_config()              # CLI + YAML → GRPOConfig (OmegaConf merge)
+  ├── get_custom_dataset()            # if/elif dispatch in areal/dataset/__init__.py
+  └── PPOTrainer(config, datasets)    # areal/trainer/ppo_trainer.py
+        ├── _create_train_engine()    # FSDPPPOActor or MegatronPPOActor
+        ├── _init_rollout()           # RemotevLLMEngine or RemoteSGLangEngine
+        └── trainer.train(workflow=..., reward_fn=...)
+              for each step:
+                actor.prepare_batch()       # async/sync bridge
+                  └── InferenceEngine.submit() × N
+                      └── WorkflowExecutor → workflow.arun_episode(engine, data)
+                          ├── engine.agenerate(req)          # LLM generation
+                          └── AsyncRewardWrapper(reward_fn)  # reward scoring
+                  └── InferenceEngine.wait()  # collect trajectories
+                actor.train_batch()           # gradient update
+                actor.update_weights()        # push weights to inference server
+```
+
+**Key abstractions** (`areal/api/`):
+
+- `RolloutWorkflow`: Single method `async arun_episode()` — the main extension point
+- `TrainEngine`: Training loop contract (FSDP2 or Megatron implementations)
+- `InferenceEngine`: Async generation client (vLLM or SGLang backends)
+- Reward functions: Plain callables, no base class — wrapped via `AsyncRewardWrapper`
+
+**Plugin system**: No decorator registry. Workflows, rewards, and engines are resolved at
+runtime via string import paths (e.g. `workflow="areal.workflow.rlvr.RLVRWorkflow"`),
+using `import_from_string()`.
+
+**Config hierarchy**: `GRPOConfig` → `PPOConfig` → `BaseExperimentConfig`, with nested
+dataclass fields (`actor`, `rollout`, `gconfig`, `scheduler`). CLI overrides use
+Hydra-style dotted paths (e.g. `scheduler.type=local`).
 
 ## HOW: Core Commands
 
@@ -40,6 +76,7 @@ uv --version                  # Install: https://docs.astral.sh/uv/
 
 # Sync dependencies
 uv sync --extra cuda          # CUDA + SGLang inference (default)
+uv sync --extra cuda-vllm     # Alternative: CUDA + vLLM inference
 uv sync --group dev           # Include dev/test packages
 uv run python3 areal/tools/validate_installation.py  # Validate installation
 
@@ -47,10 +84,14 @@ uv run python3 areal/tools/validate_installation.py  # Validate installation
 pre-commit install --install-hooks  # Set up hooks (run once)
 pre-commit run --all-files    # Format and lint
 
+# Run a single-node training (quickstart)
+python3 examples/math/gsm8k_rl.py --config examples/math/gsm8k_grpo.yaml scheduler.type=local
+
 # Run tests
 # First check GPU availability (many tests require GPU)
 python -c "import torch; print('GPU available:', torch.cuda.is_available())"
 uv run pytest tests/test_<topic>.py
+uv run pytest -sv --sw --lf tests/  # step-wise debug + rerun last failed
 
 # Generate CLI docs
 uv run python docs/generate_cli_docs.py
