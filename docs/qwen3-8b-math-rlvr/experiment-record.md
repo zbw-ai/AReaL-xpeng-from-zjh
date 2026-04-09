@@ -179,6 +179,10 @@ dataset_sft.py 自动检测 `messages` 列 → 直接使用，无需格式转换
 | 2026-04-09 | 默认从 Instruct 起步 | POLARIS 验证可行；格式稳定性好；调试范围小 | 待 P0 数据确认 |
 | 2026-04-09 | aime_2024 作为训练验证集 | 30 题，eval 成本低，业界对标指标 | 确认 |
 | 2026-04-09 | 6 数据集评测体系 | gsm8k(底线) + math_500(主指标) + aime(对标) + gpqa(泛化) + livecode(code 监控) | 确认 |
+| 2026-04-09 | SFT 用 OpenThoughts3，RLVR 用 deepmath_20k | SFT 学"怎么写"需要推理链；RLVR 学"怎么做对"只需题目+答案 | 确认 |
+| 2026-04-09 | 训练 `enable_thinking=False`，评测可开 | thinking 让序列变长、reward 更噪、RL 更难收敛；先跑稳再放大 | 确认 |
+| 2026-04-09 | 统一输出格式为 `\boxed{}` | SFT 数据 + RLVR prompt + reward 提取器三方已对齐；提取器验证 8/10 通过 | 确认 |
+| 2026-04-09 | 提交 SFT 任务 | job: bifrost-2026040915445800-zengbw1，Qwen3-8B Instruct + OpenThoughts3，单节点 8×A100 | 排队中 |
 
 ---
 
