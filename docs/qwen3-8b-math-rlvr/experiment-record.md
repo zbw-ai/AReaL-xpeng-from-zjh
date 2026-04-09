@@ -159,6 +159,71 @@ dataset_sft.py 自动检测 `messages` 列 → 直接使用，无需格式转换
 | `actor.behave_imp_weight_cap` | 2.0 |
 | `total_train_epochs` | 2 (快速验证) → 10 (完整训练) |
 
+### 5.4 算法选择
+AReaL 没有显式 `algorithm` 字段，算法由参数组合隐式决定。当前配置 = **GRPO + KL 正则化**。
+
+**当前配置对应 GRPO 的关键参数：**
+| 参数 | 当前值 | 含义 |
+|---|---|---|
+| `actor.adv_norm.mean_level` | batch | advantage 均值归一化级别 |
+| `actor.adv_norm.std_level` | batch | advantage 方差归一化级别 |
+| `actor.eps_clip` | 0.2 | PPO 对称裁剪 |
+| `actor.kl_ctl` | 0.001 | KL 惩罚系数（>0 则启用 ref model） |
+| `actor.use_decoupled_loss` | true | token-level loss |
+| `actor.behave_imp_weight_mode` | token_mask | token 级别 importance sampling |
+
+**AReaL 支持的全部算法及切换方式（只改 YAML，不改代码）：**
+| 算法 | `adv_norm mean/std` | 特殊参数 | 说明 |
+|---|---|---|---|
+| GRPO (当前) | batch / batch | — | 默认，最稳定 |
+| DAPO | batch / batch | `eps_clip_higher: 0.28`, `dynamic_bs: true`, `kl_ctl: 0.0`, `mask_no_eos_with_zero: true` | 更强探索，AIME24 50分(32B) |
+| Dr.GRPO | group / null | — | 组内归一化变体 |
+| RLOO | group / null | `mean_leave1out: true` | leave-one-out baseline |
+| GSPO | batch / batch | `importance_sampling_level: sequence` | Qwen 团队新算法 |
+| SAPO | batch / batch | `use_sapo_loss: true`, `use_decoupled_loss: false` | — |
+| PPO | batch / batch | 需额外配置 `critic:` 段 | 需要 value model |
+
+**P3 策略：先用 GRPO 跑通，效果不好时切 DAPO。** 从 GRPO 切 DAPO 只需在 YAML `actor:` 下加：
+```yaml
+eps_clip_higher: 0.28      # Clip-Higher 上界
+kl_ctl: 0.0               # 移除 KL
+mask_no_eos_with_zero: true # 截断样本排除出 loss
+# 顶层加:
+dynamic_bs: true            # Dynamic Sampling
+```
+
+### 5.5 fuyao 部署命令模板
+```bash
+# P1: SFT (单节点 8 GPU)
+fuyao deploy --disable-fault-tolerance \
+    --docker-image=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:zhangjh37-260325-0644 \
+    --project=rc-ai-infra --experiment=zengbw1/llm_rl \
+    --gpu-type a100 --gpus-per-node 8 --node=1 \
+    --label=qwen3-8b-math-sft \
+    --site=fuyao_b1 --queue=rc-llmrl-a100 \
+    SWANLAB_API_KEY=<KEY> \
+    bash fuyao_examples/fuyao_areal_run.sh \
+        --run-type math_sft \
+        --config fuyao_examples/math/qwen3_8b_sft.yaml
+
+# P3: RLVR with dapo_math_17k (双节点 16 GPU)
+fuyao deploy --disable-fault-tolerance \
+    --docker-image=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:zhangjh37-260325-0644 \
+    --project=rc-ai-infra --experiment=zengbw1/llm_rl \
+    --gpu-type a100 --gpus-per-node 8 --node=2 \
+    --label=qwen3-8b-math-rlvr \
+    --site=fuyao_b1 --queue=rc-llmrl-a100 \
+    SWANLAB_API_KEY=<KEY> \
+    bash fuyao_examples/fuyao_areal_run.sh \
+        --run-type math_rlvr \
+        --config fuyao_examples/math/qwen3_8b_rlvr.yaml
+
+# P5: RLVR with deepmath_20k (CLI 覆盖数据集)
+# 在上面 P3 命令的 bash 行末追加:
+#   train_dataset.type=deepmath \
+#   train_dataset.path=/workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+```
+
 ---
 
 ## 6. 实验日志
