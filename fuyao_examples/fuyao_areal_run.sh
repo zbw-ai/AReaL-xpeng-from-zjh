@@ -200,13 +200,13 @@ case "$RUN_TYPE" in
 esac
 
 # ========================== 7. run-type → Python 入口映射 ==========================
-declare -A LAUNCH_SCRIPTS=(
-    ["math_sft"]="fuyao_examples/math/train_math_sft.py"
-    ["math_rlvr"]="fuyao_examples/math/train_math_rlvr.py"
-    ["search_r1"]="fuyao_examples/search_r1/train_search_r1.py"
-    ["code_dapo"]="fuyao_examples/code_dapo/train_code_dapo.py"
-)
-LAUNCH_SCRIPT="${LAUNCH_SCRIPTS[$RUN_TYPE]}"
+case "$RUN_TYPE" in
+    math_sft)   LAUNCH_SCRIPT="fuyao_examples/math/train_math_sft.py" ;;
+    math_rlvr)  LAUNCH_SCRIPT="fuyao_examples/math/train_math_rlvr.py" ;;
+    search_r1)  LAUNCH_SCRIPT="fuyao_examples/search_r1/train_search_r1.py" ;;
+    code_dapo)  LAUNCH_SCRIPT="fuyao_examples/code_dapo/train_code_dapo.py" ;;
+    *)          echo "Error: No launch script for run-type '$RUN_TYPE'"; exit 1 ;;
+esac
 
 if [[ ! -f "${PROJECT_ROOT}/${LAUNCH_SCRIPT}" ]]; then
     echo "Error: Launch script not found: ${PROJECT_ROOT}/${LAUNCH_SCRIPT}"
