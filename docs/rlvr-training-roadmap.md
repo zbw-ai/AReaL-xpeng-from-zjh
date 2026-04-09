@@ -43,7 +43,8 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 - 基础框架：AReaL（当前仓库），训练后端 Megatron + SGLang
 - 实验跟踪：SwanLab
 - 提交入口：`fuyao_examples/fuyao_areal_run.sh`
-- 实验模型：**Qwen3-8B**（已有 SFT checkpoint：`qwen3_8b_base_ot3_sft_0105/global_step_4450`）
+- 实验模型：**Qwen3-8B-Base + SFT**（已有 SFT checkpoint：`qwen3_8b_base_ot3_sft_0105/global_step_4450`）
+- 选择 Base 而非 Instruct 的理由：更高的探索多样性 + 无 RLHF alignment tax（详见 3.3 节）
 - 集群规模：2 节点 × 8 GPU = 16 GPU（A100 80G）
 
 ---
@@ -63,13 +64,45 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 | 风险 | 低：可在 1-2 天内验证完整流程 | 高：任何环节出错都阻塞全局 |
 
 结论：**math-only 是正确的第一步**。POLARIS 证明 4B 模型仅 700 步 RL 就能在 AIME24 达到 81.2%，说明 math 任务足以验证 RL pipeline 的有效性。后续扩展到 agentic 场景时，math RLVR checkpoint 是更好的起点（比 base model 有更强的推理基础）。
-### 3.3 关键设计决策
+### 3.3 起始模型选择：Base vs Instruct
+
+**推荐：Qwen3-8B-Base + SFT → RLVR**（使用已有 SFT checkpoint）
+
+| 维度 | Qwen3-8B-Base (+ SFT) | Qwen3-8B (instruct) |
+|---|---|---|
+| 数学基线 | GSM8K 89.84, MATH 60.80 (base) | MATH-500 95.16% (thinking), 43.55% (non-thinking) |
+| 探索多样性 | 高：未经 RLHF 压缩，entropy 保持完整 | 低：RLHF 导致 40-79% 问题只产生单一语义簇 |
+| KL penalty | 可完全去掉 (kl_ctl=0.0)，训练更简洁 | 通常需要保留，防止偏移过大 |
+| pass@k 上限 | 更高：base 模型在大 k 下反而超过 RL 后的 instruct | 较低：RL 后 pass@k 反而可能收窄 |
+| 格式稳定性 | 需要 SFT 解决（已有 checkpoint） | 原生支持 `<think>` 模式 |
+| 社区验证 | 数学推理 RL 的主流选择 | POLARIS (4B instruct) 验证可行 |
+
+**选择 Base 的三个核心理由：**
+
+1. **探索空间更大**：Instruct 模型经过 RLHF/DPO 后，输出多样性被严重压缩（研究表明单一语义簇比例从 base 的 1% 升到 instruct 的 28.5%）。RLVR 本质是搜索压缩（pass@k → pass@1），起点的 pass@k 越高，RL 能压缩出的增益越大。Base 模型的 pass@k 上限更高。
+
+2. **训练更简洁**：Base 模型做 RL 可以完全移除 KL penalty（kl_ctl=0.0），减少一个需要调的超参数。Instruct 模型因为已有 RLHF 对齐，通常需要保留 KL 约束防止灾难性遗忘，增加了调参复杂度。
+
+3. **已有 SFT checkpoint 补齐格式短板**：Base 模型唯一的劣势是格式不稳定，但我们已有内部 SFT checkpoint（`qwen3_8b_base_ot3_sft_0105/global_step_4450`），这恰好提供了"base 模型的探索潜力 + SFT 的格式稳定性"的最佳组合，同时没有 RLHF 的 alignment tax。
+
+**备选方案**：如果 SFT checkpoint 质量不满意（答案提取成功率 < 90% 或格式混乱），可以回退到 Qwen3-8B（instruct），跳过 SFT 直接 RL。POLARIS 验证了从 instruct 直接 RL 同样有效。
+
+**参考数据**：社区从 Qwen3-8B-Base 出发做 SFT+GRPO 的实验结果：
+| 阶段 | GSM8K | AIME24 |
+|---|---|---|
+| Base | 61.92 | 10.0 |
+| +SFT | 63.48 | 13.3 |
+| +SFT+GRPO | 83.59 | 16.7 |
+
+（注：上述为 LoRA 消费级 GPU 结果，full finetune + 更多 GPU 预期更好）
+
+### 3.4 其他关键设计决策
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| 起始模型 | Qwen3-8B SFT checkpoint | 已完成 SFT，直接进入 RL 阶段，跳过 Phase 0/1 |
+| 起始模型 | Qwen3-8B-Base + SFT checkpoint | 高探索空间 + 格式稳定，无 RLHF alignment tax |
 | RL 算法 | GRPO（kl_ctl=0.001，当前 8B 配置） | 先用已验证的 GRPO 跑通，再考虑切换 DAPO |
 | 数据集 | dapo_math_17k | 已在仓库中集成，数据量适中，覆盖多难度等级 |
-| KL 惩罚 | kl_ctl=0.001 | 8B 配置使用轻量 KL 约束，比纯 DAPO 更保守稳定 |
+| KL 惩罚 | kl_ctl=0.001（保守起步）→ 0.0（跑稳后尝试） | 因为用的是 base+SFT，理论上可以完全去掉 KL |
 | 采样数 | n_samples=8 | 8B 配置已设定，平衡效率和多样性 |
 | 集群 | 2 节点 16 GPU | Actor 8GPU (node 0) + SGLang 8GPU (node 1) |
 
