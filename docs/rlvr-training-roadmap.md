@@ -1,13 +1,14 @@
-# LLM 后训练路线图：从 Math RLVR 到 Agentic RL
-> 版本：v1.0 | 作者：zengbw | 日期：2026-04-09
+# Qwen3-8B 后训练路线图：Math RLVR → Code → Agentic RL
+> 版本：v1.1 | 作者：zengbw | 日期：2026-04-09
+> 实验模型：Qwen3-8B | 集群：2 节点 × 8 GPU (A100 80G) | 聚焦：math 单任务先行
 
 ---
 
 ## 1. 需求内容
 ### 1.1 需求目标
-基于开源 base/instruct 模型（Qwen3 系列），通过 SFT → RLVR → Agentic RL 多阶段后训练，复现业界已验证的训练路线，实现模型通用推理、代码生成和工具使用能力的提升。
+基于 Qwen3-8B（已完成 SFT 的 checkpoint），通过 RLVR → Agentic RL 多阶段后训练，复现业界已验证的训练路线，实现模型通用推理、代码生成和工具使用能力的提升。
 ### 1.2 验证目标
-- Phase 1（快速验证）：在 math 单一任务上跑通 RLVR 全流程，reward 曲线稳步上升，AIME/MATH 等 benchmark 有可观测提升
+- Phase 1（核心验证）：使用 Qwen3-8B SFT checkpoint，在 math 任务上跑通 RLVR 全流程，reward 曲线稳步上升，GSM8K/MATH/AIME 有可观测提升
 - Phase 2（能力扩展）：在 Phase 1 checkpoint 基础上扩展到代码执行（Code DAPO）和搜索增强（Search R1）agentic 场景
 - Phase 3（通用对齐）：可选，通过 DPO/RLHF 对齐通用偏好，提升安全性和有用性
 ### 1.3 参考方案
@@ -42,7 +43,8 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 - 基础框架：AReaL（当前仓库），训练后端 Megatron + SGLang
 - 实验跟踪：SwanLab
 - 提交入口：`fuyao_examples/fuyao_areal_run.sh`
-- 模型：Qwen3-4B（快速验证）→ Qwen3-8B（中等规模）→ Qwen3-30B-A3B（MoE，目标规模）
+- 实验模型：**Qwen3-8B**（已有 SFT checkpoint：`qwen3_8b_base_ot3_sft_0105/global_step_4450`）
+- 集群规模：2 节点 × 8 GPU = 16 GPU（A100 80G）
 
 ---
 
@@ -64,11 +66,12 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 ### 3.3 关键设计决策
 | 决策 | 选择 | 理由 |
 |---|---|---|
-| 起始模型 | Qwen3-4B base（快速验证）或 instruct（跳过 SFT） | POLARIS 验证了从 instruct 直接 RL 的可行性；base 需要额外 SFT 阶段 |
-| RL 算法 | DAPO（GRPO 变体） | 50% 步数超越 R1-Zero；解决 entropy collapse；AReaL 已有 GRPO 实现可复用 |
+| 起始模型 | Qwen3-8B SFT checkpoint | 已完成 SFT，直接进入 RL 阶段，跳过 Phase 0/1 |
+| RL 算法 | GRPO（kl_ctl=0.001，当前 8B 配置） | 先用已验证的 GRPO 跑通，再考虑切换 DAPO |
 | 数据集 | dapo_math_17k | 已在仓库中集成，数据量适中，覆盖多难度等级 |
-| KL 惩罚 | kl_ctl=0.0 | DAPO 论文明确移除 KL 惩罚，效果更好 |
-| 采样数 | n_samples=4~16 | 4 为快速验证起点，16 为效果最优配置 |
+| KL 惩罚 | kl_ctl=0.001 | 8B 配置使用轻量 KL 约束，比纯 DAPO 更保守稳定 |
+| 采样数 | n_samples=8 | 8B 配置已设定，平衡效率和多样性 |
+| 集群 | 2 节点 16 GPU | Actor 8GPU (node 0) + SGLang 8GPU (node 1) |
 
 ---
 
@@ -103,140 +106,162 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 ### 4.2 需要新增/调整的工作
 | 工作项 | 说明 | 优先级 |
 |---|---|---|
-| Phase 0 评估脚本 | 编写 pass@k 评估脚本，在 MATH/AIME/GSM8K 上评估 base model 能力上限 | P0 |
-| DAPO 超参调优 | 当前配置使用 REINFORCE 算法（kl_ctl=0.0, reward_norm=group），需要按 DAPO 论文调整 clip_higher 等参数 | P0 |
-| SFT 训练配置 | 如果 base model pass@64 不足，需要配置 SFT 训练（可使用现有 `SFTTrainer`） | P1 |
-| Entropy 监控 | 在 SwanLab 中增加 entropy 指标追踪，及时发现 entropy collapse | P0 |
-| Checkpoint 兼容性 | 验证 math RLVR checkpoint 能否直接加载到 Code DAPO / Search R1 配置中继续训练 | P2 |
+| 启动 8B RLVR 快速验证 | 使用 `qwen3_8b_rlvr.yaml`，先跑 2 epochs 观察指标 | P0 |
+| Entropy 监控 | 在 SwanLab 中确认 entropy 指标追踪正常，及时发现 entropy collapse | P0 |
+| Reward 正确率基线 | 用 SFT checkpoint 在 dapo_math_17k 上跑 pass@1，确认在 20%-80% 区间 | P0 |
+| 独立验证集评估 | 确保 eval 用了独立数据（非训练集），监控泛化而非记忆 | P1 |
+| 高奖励样本回灌 | RLVR 跑稳后，筛选高 reward 样本回灌 SFT，作为下一轮 RL 更好的起点 | P2 |
+| Code DAPO 8B 适配 | 基于 RLVR checkpoint，适配 code_dapo 配置到 8B 并行策略 | P2 |
 
 ---
 
 ## 5. 实验配置
-### 5.1 Phase 0: 能力评估（训练前必做）
-**目标**：确定 base model 的 pass@k 能力上限，决定是否需要 SFT 阶段。
+### 5.1 Phase 0/1: 跳过（已有 SFT checkpoint）
+当前使用的 Qwen3-8B 已经完成了 SFT 阶段（checkpoint: `qwen3_8b_base_ot3_sft_0105/global_step_4450`），**直接进入 Phase 2 RLVR**。
+
+如未来需要从 base model 重新训练，Phase 0/1 流程参见 Decision Tree：
 
 ![Decision Tree](images/04_decision_tree.png)
 
-**评估方案**：
-| 评估项 | 数据集 | 指标 | 判断标准 |
-|---|---|---|---|
-| 数学推理 | GSM8K (1319 题) | pass@1, pass@4, pass@16, pass@64 | pass@64 > 50% 则 RL 有空间 |
-| 数学推理 | MATH-500 | pass@1, pass@4 | pass@1 作为 baseline |
-| 竞赛数学 | AIME 2024 (30 题) | pass@1 | 作为对标 DAPO/R1 的参考 |
-| 格式合规 | 随机 100 题 | `<think>` 标签出现率 | > 80% 可跳过 SFT |
-
-**决策树**：参见上方 Decision Tree 图表。
-
-### 5.2 Phase 1: Cold-Start SFT（按需执行）
-**输入**: Base model (Qwen3-4B)
-**输出**: 格式稳定、具备基础推理链的 checkpoint
-**训练框架**: AReaL `SFTTrainer`（`areal/trainer/sft_trainer.py`）
-
-**数据来源（任选其一或混合）**：
-| 数据集 | 规模 | 来源 | 特点 |
-|---|---|---|---|
-| OpenR1-Math-220k | 220K | HuggingFace open-r1 | 从 DeepSeek-R1 蒸馏的数学推理轨迹 |
-| Skywork-OR1-RL-Data | 105K 数学 + 14K 代码 | GitHub Skywork-OR1 | 高质量，含代码推理 |
-| NuminaMath-CoT | 860K | HuggingFace | 数学 CoT，规模最大 |
-
-推荐组合: OpenR1-Math-220k（主体）+ Skywork-OR1 代码部分（14K，增加多样性）
-
-**数据格式要求**：
-```json
-{
-  "messages": [
-    {"role": "user", "content": "Solve: x^2 + 3x - 4 = 0"},
-    {"role": "assistant", "content": "<think>\nI need to factor x^2 + 3x - 4.\n...\n</think>\n\nThe solutions are x = -4 and x = 1."}
-  ]
-}
-```
-
-**SFT 超参数**：
-| 参数 | 值 | 说明 |
-|---|---|---|
-| epochs | 8-10 | Skywork-OR1 发现 AIME 精度在 epoch 10 才饱和，短 SFT (1-3 epoch) 会导致 RL 不稳定 |
-| learning_rate | 1e-5 | cosine decay |
-| warmup_ratio | 0.03 | |
-| max_seq_len | 8192 | 推理链需要较长上下文 |
-| global_batch_size | 128-256 | |
-| weight_decay | 0.01 | |
-| dtype | bfloat16 | |
-
-**停止标准**：
-- 验证集 loss 不再下降（连续 2 个 epoch）
-- GSM8K pass@1 > 70%（4B 模型）
-- 随机采样 100 条输出，`<think>` 标签出现率 > 90%
-
-### 5.3 Phase 2: Math RLVR（核心阶段）
-**输入**: Phase 1 checkpoint 或 instruct model
+### 5.2 Phase 2: Math RLVR — Qwen3-8B（核心阶段）
+**输入**: Qwen3-8B SFT checkpoint
 **输出**: 数学推理能力显著提升的 checkpoint
 **训练框架**: AReaL `PPOTrainer` + `RLVRWorkflow`
+**配置文件**: `fuyao_examples/math/qwen3_8b_rlvr.yaml`
 
-#### 5.3.1 基础配置（基于现有 qwen3_4b_rlvr.yaml）
-| 参数 (YAML path) | 当前值 | 建议调整 | 理由 |
-|---|---|---|---|
-| `gconfig.n_samples` | 4 | 8-16 | 增加采样多样性，DAPO 论文推荐 16 |
-| `actor.optimizer.lr` | 1.0e-6 | 5.0e-7 ~ 1.0e-6 | 保守起步，观察稳定性后调整 |
-| `actor.optimizer.weight_decay` | 0 | 0.1 | DAPO 推荐，防止参数极端值 |
-| `actor.optimizer.beta2` | 0.999 | 0.99 | DeepSeek 推荐，适合 RL 噪声梯度 |
-| `actor.optimizer.gradient_clipping` | 1.0 | 0.1 | DAPO 使用激进梯度裁剪 |
-| `actor.eps_clip` | 0.2 | 0.2 (保持) | DAPO clip_low，不变 |
-| `actor.kl_ctl` | 0.0 | 0.0 (保持) | DAPO 移除 KL 惩罚 |
-| `actor.reward_scaling` | 10.0 | 1.0 | 默认不缩放，观察原始 reward 信号 |
-| `actor.reward_bias` | -0.5 | 0.0 | 默认不偏置 |
-| `actor.behave_imp_weight_cap` | 5.0 | 2.0 | 更严格的 importance weight 裁剪 |
-| `total_train_epochs` | 10 | 2-3 | 快速验证，观察 reward 趋势后决定 |
-| `gconfig.temperature` | 0.99 | 1.0 | DAPO 标准设置 |
+#### 5.2.1 完整实验配置（基于 qwen3_8b_rlvr.yaml）
+**模型与数据：**
+| 参数 (YAML path) | 值 | 说明 |
+|---|---|---|
+| `actor.path` | `/dataset_rc_b1/.../qwen3_8b_base_ot3_sft_0105/global_step_4450/huggingface` | SFT checkpoint |
+| `train_dataset.type` | dapo_math | 17K 数学题，parquet 格式 |
+| `train_dataset.batch_size` | 16 | 每步 16 个 prompt |
+| `total_train_epochs` | 10 | 约 10870 步/epoch |
+
+**生成配置：**
+| 参数 (YAML path) | 值 | 说明 |
+|---|---|---|
+| `gconfig.n_samples` | 8 | 每个 prompt 生成 8 条回复 |
+| `gconfig.max_new_tokens` | 8192 | 最大生成长度 |
+| `gconfig.temperature` | 0.99 | 高温采样促进多样性 |
+| `gconfig.top_p` | 0.99 | nucleus sampling |
+| `gconfig.top_k` | 100 | top-k 采样 |
+
+**训练核心超参数：**
+| 参数 (YAML path) | 值 | 说明 |
+|---|---|---|
+| `actor.optimizer.lr` | 1.0e-6 | 学习率 |
+| `actor.optimizer.weight_decay` | 0.1 | DAPO 推荐，防止参数极端值 |
+| `actor.optimizer.beta1` | 0.9 | Adam 动量 |
+| `actor.optimizer.beta2` | 0.999 | Adam 二阶矩 |
+| `actor.optimizer.lr_scheduler_type` | cosine | 余弦退火 |
+| `actor.optimizer.gradient_clipping` | 1.0 | 梯度裁剪 |
+| `actor.optimizer.warmup_steps_proportion` | 0.01 | 暖启比例 |
+| `actor.eps_clip` | 0.2 | PPO clip ratio |
+| `actor.kl_ctl` | 0.001 | 轻量 KL 约束（GRPO 模式） |
+| `actor.reward_scaling` | 1.0 | 不缩放 reward |
+| `actor.reward_bias` | 0.0 | 不偏置 reward |
+| `actor.behave_imp_weight_cap` | 2.0 | importance weight 裁剪 |
+| `actor.behave_imp_weight_mode` | token_mask | token 级别 IS 修正 |
+| `actor.use_decoupled_loss` | true | token-level loss（符合 DAPO 要求） |
+| `actor.adv_norm` | batch-level mean+std | advantage 归一化 |
+| `actor.reward_norm` | group-level (group_size=8) | 组内 reward 归一化 |
+
+**并行策略：**
+| 参数 (YAML path) | 值 | 说明 |
+|---|---|---|
+| `actor.backend` | megatron:d2t2p2 | DP2 × TP2 × PP2 = 8 GPU (node 0) |
+| `rollout.backend` | sglang:d4p1t2 | DP4 × TP2 = 8 GPU (node 1) |
+| `ref.scheduling_strategy` | colocation with actor | Ref 与 Actor 共置 |
+| `sglang.mem_fraction_static` | 0.85 | SGLang 静态显存 |
+| `sglang.disable_custom_all_reduce` | true | 避免 TP2 下 custom_all_reduce 崩溃 |
 
 ![AReaL RLVR Architecture](images/02_rlvr_architecture.png)
 
-#### 5.3.2 DAPO 特有调整（需要代码层面支持）
+#### 5.2.2 集群资源配置（2 节点 × 8 GPU）
+| 角色 | GPU 数 | 节点 | 并行策略 | 说明 |
+|---|---|---|---|---|
+| Actor (Megatron) | 8 | node 0 | DP2 × TP2 × PP2 | PP2 减半单卡显存，为 Ref 腾空间 |
+| SGLang Rollout | 8 | node 1 | DP4 × TP2 | 静态显存 85%，context=16384 |
+| Ref Model | 0 | node 0 | colocation with actor | 与 Actor 共置，冻结权重 |
+
+#### 5.2.3 Reward 设计（渐进式）
+**第一版 reward（先跑通）：**
+- 答案正确 = 1，错误 = 0（二值 reward）
+- 使用现有 `fuyao_examples/reward.py` 的 `math_reward_fn`
+- 通过 math_verify 库验证 `\boxed{...}` 中提取的答案
+
+**第二版 reward（跑稳后可选加入）：**
+| 辅助项 | 权重 | 说明 |
+|---|---|---|
+| 格式合法奖励 | 0.1 | 鼓励 `<think>` 标签 |
+| 过长惩罚 | -0.1 × (len/max_len) | 防止输出无限增长 |
+
+注意：一开始不要把 reward 做复杂，否则不知道到底是哪一项起作用。
+
+#### 5.2.4 数据集要求
+dapo_math_17k 包含多难度等级的数学题。需要确保训练集里有足够比例的"模型会一部分但做不稳"的题（即 reward 在 20%-80% 区间）。
+
+如果模型在训练集上已经 > 80% 正确率，说明题目太简单，reward 没梯度，RLVR 不会明显提升。需要补充更难的题目。
+
+#### 5.2.5 DAPO 进阶调整（效果不好时再考虑）
 
 ![DAPO vs GRPO](images/03_dapo_vs_grpo.png)
+
+当前 8B 配置使用 GRPO（kl_ctl=0.001），这是更保守稳定的选择。如果跑通后想进一步提升，可以尝试切换到 DAPO：
 | DAPO 技术 | 对应 AReaL 配置 | 说明 |
 |---|---|---|
-| Clip-Higher | `actor.eps_clip` = 0.2（低），需新增 `eps_clip_high` = 0.28 | 解耦上下 clip 阈值，允许更大探索空间。**[待确认]** AReaL 是否支持双 clip 参数 |
-| Dynamic Sampling | rollout 层过滤 reward std=0 的样本组 | **[待确认]** AReaL 是否支持 dynamic sampling |
-| Token-Level Loss | `actor.use_decoupled_loss: true` (已开启) | 当前已使用 token-level loss，符合 DAPO 要求 |
-| Overlong Mask | 需确认截断响应是否从 loss 中排除 | **[待确认]** `max_new_tokens: 8192` 截断时的 loss 处理 |
+| Clip-Higher | 需新增 `eps_clip_high` = 0.28 | **[待确认]** AReaL 是否支持双 clip 参数 |
+| Dynamic Sampling | rollout 层过滤 reward std=0 的样本组 | **[待确认]** AReaL 是否支持 |
+| Token-Level Loss | `actor.use_decoupled_loss: true` (已开启) | 已符合 DAPO 要求 |
+| 移除 KL | `actor.kl_ctl: 0.0` | 从 0.001 降到 0.0 |
 
-#### 5.3.3 集群资源配置
-**Qwen3-4B（快速验证，1 节点）：**
-| 角色 | GPU 数 | 并行策略 | 显存特征 |
-|---|---|---|---|
-| Actor (Megatron) | 4 | DP4, TP1, PP1 | 峰值 ~79 GB，稳态 ~69% |
-| SGLang Rollout | 4 | DP4, TP1 | 静态 70%，context_length=16384 |
-| Ref Model | 0 (与 Actor 共置) | colocation | 复用 Actor 显存 |
+### 5.3 RLVR 跑稳后的优化闭环
+RLVR 跑稳后有两条可选优化路径，优先考虑回灌 SFT：
 
-**Qwen3-8B（标准实验，2 节点）：**
-| 角色 | GPU 数 | 并行策略 | 显存特征 |
-|---|---|---|---|
-| Actor (Megatron) | 8 (node 0) | DP2, TP2, PP2 | PP2 减半单卡显存 |
-| SGLang Rollout | 8 (node 1) | DP4, TP2 | 静态 85% |
-| Ref Model | 0 (与 Actor 共置) | colocation | 需要 PP2 为 Ref 腾出空间 |
+**路径 A: 高奖励样本回灌 SFT（推荐）**
+```
+RLVR checkpoint → 用 RL 后的 policy 在训练集上 rollout
+  → 筛选 reward=1 的高质量样本
+  → 回灌做新一轮 SFT（数据质量 > 数据数量）
+  → 再用新 SFT checkpoint 做第二轮 RLVR
+```
+这是 DeepSeek-R1 验证过的路线：R1-Zero → 收集数据做 SFT → 再 RLVR，效果好于单纯延长 RL。
 
-### 5.4 Phase 3: Agentic RL（扩展阶段）
-**输入**: Phase 2 的 RLVR checkpoint
-**输出**: 具备工具调用能力的 agent 模型
+**路径 B: 轻量 DPO（RL 不稳时优先补）**
+DPO 在这里的作用不是增强数学能力，而是：
+- 拉齐输出风格，减少废话
+- 提高格式稳定性
+- 降低 RLVR 的 reward 方差
 
-**Code DAPO 配置要点**（基于 `fuyao_examples/code_dapo/code_dapo_qwen3_4b.yaml`）：
-| 参数 | 值 | 说明 |
-|---|---|---|
-| `actor.path` | Phase 2 checkpoint 路径 | 从 RLVR checkpoint 继续训练 |
-| `agentic.max_turns` | 10 | 最大对话轮数 |
-| `agentic.max_tool_uses` | 1 | 每轮最多 1 次工具调用 |
-| `agentic.code_timeout` | 5 | 代码执行超时秒数 |
-| `gconfig.n_samples` | 1 | agentic 场景每次 1 条（多轮交互成本高） |
-| `train_dataset.batch_size` | 128 | 更大 batch 补偿单样本 |
+如果发现 RL 不稳（reward 震荡、格式混乱），最先补的通常就是一层轻量 DPO，而不是猛调 RL 超参。
 
-**Search R1 配置要点**（基于 `fuyao_examples/search_r1/search_r1_qwen3_4b.yaml`）：
-| 参数 | 值 | 说明 |
-|---|---|---|
-| `actor.path` | Phase 2 checkpoint 路径 | 从 RLVR checkpoint 继续训练 |
-| `agentic.retrieval_endpoint` | 搜索服务地址 | 需要预先部署检索服务 |
-| `agentic.max_turns` | 10 | 最大搜索轮数 |
-| `agentic.max_tool_uses` | 2 | 每轮最多 2 次搜索 |
-| `gconfig.n_samples` | 1 | 同上 |
+### 5.4 后续扩展路线（Phase 2 跑稳后）
+Phase 2 跑稳的标志：reward 曲线在 100 步内开始上升，独立验证集准确率持续提升，entropy 不崩溃。
+
+跑稳后按以下顺序扩展，**每次只加一个任务**：
+
+**Step 2: 加 code（最自然的扩展，reward 同样可验证）**
+```
+math-stabilized checkpoint
+  → code SFT（少量高质量代码解题数据）
+  → code RLVR（unit test / compile / execution 作为 verifier）
+  → 混合 math + code 训练
+```
+配置：`fuyao_examples/code_dapo/code_dapo_qwen3_4b.yaml`（需适配 8B）
+
+**Step 3: 加 tool use**
+```
+math+code checkpoint
+  → tool-use SFT
+  → short-horizon tool RL
+```
+配置：`fuyao_examples/search_r1/search_r1_qwen3_4b.yaml`（需适配 8B）
+
+**Step 4: Agentic RL（最后）**
+```
+multi-turn environment → short horizon → longer horizon
+```
 
 ---
 
@@ -246,15 +271,15 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 
 ## 6. 实验结果
 ### 6.1 已有基线数据
-**Qwen3-4B Math RLVR 基础设施测试**（来自 infra-reports/20260407）：
-| 指标 | 值 | 说明 |
+**Qwen3-4B infra 测试参考**（来自 infra-reports/20260407，4B 单节点）：
+| 指标 | 4B 值 | 8B 预期 |
 |---|---|---|
-| 任务完成 | 通过 | 跑完 46 步，无崩溃 |
-| GPU 利用率 | 44.52% | RL 训练正常水平 |
-| GPU 显存 | 68.69% (78.63/79.25 GB) | 有余量 |
-| 单步耗时 | ~19s | rollout 34% + train 51% + update 14% |
-| sample_staleness | 1.8-2.0 | 在 max_head_offpolicyness=2 范围内，正常 |
-| 预估全量时长 | ~75h (10 epochs, 10870 步) | 建议先用 2 epochs 快速验证 |
+| 任务完成 | 通过（46 步无崩溃） | 待验证 |
+| 单步耗时 | ~19s | 预计更长（TP2+PP2 通信开销） |
+| GPU 利用率 | 44.52% | 待验证 |
+| sample_staleness | 1.8-2.0 | 预计相近（相同 offpolicyness=2） |
+
+**Qwen3-8B 预估**：2 节点 16GPU，模型参数量是 4B 的 2 倍，TP2+PP2 通信增加，预计单步耗时 30-50s。建议先用 `total_train_epochs=2` 快速验证。
 
 ### 6.2 业界对标基线
 | 模型 | 算法 | AIME24 | MATH-500 | GSM8K | 训练步数 | 来源 |
@@ -282,79 +307,76 @@ DeepSeek-R1 证明了纯 RL 可以从 base model 涌现推理能力（R1-Zero）
 ## 7. 实验结论
 **[待补充]** 实验执行后填入具体结论。
 
-### 7.1 预期验证项
+### 7.1 预期验证项（Qwen3-8B Math RLVR）
 | 验证项 | 成功标准 | 状态 |
 |---|---|---|
-| Math RLVR pipeline 跑通 | reward 曲线在 100 步内开始上升 | 待验证 |
+| 8B RLVR pipeline 跑通 | 2 节点 16GPU 训练无崩溃，完成 2 epochs | 待验证 |
+| reward 曲线上升 | reward_mean 在 100 步内开始上升 | 待验证 |
 | Entropy 不崩溃 | 训练全程 entropy > 0.5 | 待验证 |
-| Benchmark 提升 | GSM8K pass@1 提升 > 5% | 待验证 |
-| Checkpoint 兼容 | RLVR checkpoint 能加载到 Code DAPO 配置 | 待验证 |
-| Agentic RL 跑通 | Code DAPO 多轮交互正常，reward 有信号 | 待验证 |
+| 独立验证集准确率提升 | eval accuracy 相比 SFT baseline 提升 > 5% | 待验证 |
+| 输出格式稳定 | 答案可从 `\boxed{}` 中提取，提取成功率 > 95% | 待验证 |
 
 ---
 
 ## 8. 复现指南
-### 8.1 实验执行步骤
+### 8.1 实验执行步骤（Qwen3-8B Math RLVR）
 
-#### Step 0: 能力评估
+#### Step 1: 快速验证（2 epochs）
 ```bash
-# 1. 评估 base model 的 pass@k
-# [待补充] 评估脚本路径和命令
+# 确认模型和数据路径可访问
+ls /dataset_rc_b1/llm_train_sft/lijl42/SFT_Qwen3_8B_Base/qwen3_8b_base_ot3_sft_0105/global_step_4450/huggingface
+ls /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
 
-# 2. 根据结果决定是否需要 SFT
-# 判断标准: GSM8K pass@64 > 50% 可跳过 SFT
-```
-
-#### Step 1: Cold-Start SFT（如需要）
-```bash
-# 1. 准备 SFT 数据 (OpenR1-Math-220k)
-# [待补充] 数据下载和预处理命令
-
-# 2. 配置 SFT YAML (基于 examples/math/gsm8k_sft.py 格式)
-# [待补充] SFT 配置文件路径
-
-# 3. 启动 SFT 训练
-# [待补充] 启动命令
-```
-
-#### Step 2: Math RLVR（核心步骤）
-```bash
-# 1. 确认模型路径
-#    - 如果做了 SFT: 指向 SFT checkpoint
-#    - 如果用 instruct: 指向 /publicdata/huggingface.co/Qwen/Qwen3-4B
-#    修改 YAML 中 actor.path 和 ref.path
-
-# 2. 快速验证 (2 epochs, ~3h)
+# 启动 8B Math RLVR (2 节点, 16 GPU)
+# 先改 total_train_epochs=2 做快速验证
 bash fuyao_examples/fuyao_areal_run.sh \
     --run-type math_rlvr \
-    --config fuyao_examples/math/qwen3_4b_rlvr.yaml \
+    --config fuyao_examples/math/qwen3_8b_rlvr.yaml \
     --swanlab-api-key $SWANLAB_API_KEY
-
-# 3. 观察 SwanLab 指标:
-#    - reward_mean: 是否上升
-#    - entropy: 是否崩溃
-#    - response_length_mean: 是否爆炸
-
-# 4. 如果 reward 持续上升且 entropy 稳定:
-#    调整 total_train_epochs=10, 完整训练
 ```
 
-#### Step 3: Agentic RL（扩展步骤）
-```bash
-# 1. 修改 Code DAPO 配置中的 actor.path 指向 Phase 2 checkpoint
-# 编辑 fuyao_examples/code_dapo/code_dapo_qwen3_4b.yaml:
-#   actor.path: /path/to/phase2/checkpoint
+#### Step 2: 观察 SwanLab 指标（前 100 步）
+```
+必须看的 4 个指标:
+1. reward_mean      — 是否上升？（100 步内应开始上升）
+2. entropy          — 是否崩溃？（不应急降到 ~0）
+3. response_length  — 是否爆炸？（不应无限增长）
+4. eval accuracy    — 独立验证集准确率是否提升？
 
-# 2. 启动 Code DAPO 训练
+训练 reward 在升 ≠ 模型真的变强，一定要看验证集！
+```
+
+#### Step 3: 根据观察决定下一步
+```
+情况 A: reward 上升 + entropy 稳定 + eval 准确率提升
+  → 成功！调整 total_train_epochs=10，完整训练
+  → 训练完成后，筛选高奖励样本，回灌做新一轮 SFT（可选）
+
+情况 B: reward 停滞不动
+  → 检查 reward 函数：单独测试 math_reward_fn，确认正确率在 20%-80%
+  → 如果正确率 > 80%：题目太简单，需要补充更难的题
+  → 如果正确率 < 20%：SFT checkpoint 太弱，考虑更多 SFT
+  → 增加 n_samples: 8 → 16
+
+情况 C: entropy 急剧下降到 ~0
+  → 降低 lr: 1e-6 → 5e-7
+  → 增大 gradient_clipping: 1.0 → 0.1（更激进裁剪）
+  → 如果仍崩溃，考虑切换到 DAPO (见 5.2.5)
+
+情况 D: response_length 无限增长
+  → reward hacking 信号，加入长度惩罚
+  → 或增加 max_new_tokens 给模型更多空间
+```
+
+#### Step 4: 完整训练后扩展（Phase 2 跑稳后）
+```bash
+# 后续扩展到 code（需要先适配 8B 配置）
+# 1. 复制 code_dapo_qwen3_4b.yaml → code_dapo_qwen3_8b.yaml
+# 2. 修改 actor.path 指向 Phase 2 checkpoint
+# 3. 调整并行策略为 d2t2p2 / sglang:d4p1t2
 bash fuyao_examples/fuyao_areal_run.sh \
     --run-type code_dapo \
-    --config fuyao_examples/code_dapo/code_dapo_qwen3_4b.yaml \
-    --swanlab-api-key $SWANLAB_API_KEY
-
-# 3. 启动 Search R1 训练 (需要先部署检索服务)
-bash fuyao_examples/fuyao_areal_run.sh \
-    --run-type search_r1 \
-    --config fuyao_examples/search_r1/search_r1_qwen3_4b.yaml \
+    --config fuyao_examples/code_dapo/code_dapo_qwen3_8b.yaml \
     --swanlab-api-key $SWANLAB_API_KEY
 ```
 
@@ -364,27 +386,31 @@ bash fuyao_examples/fuyao_areal_run.sh \
 当训练效果不好时，按以下优先级调整：
 
 **第一优先级（影响最大）：**
-| 参数 | 调整方向 | 预期效果 |
-|---|---|---|
-| `gconfig.n_samples` | 4 → 8 → 16 | 增加采样多样性，reward 方差更小 |
-| `actor.optimizer.gradient_clipping` | 1.0 → 0.1 | 稳定训练，防止梯度爆炸 |
-| `actor.optimizer.weight_decay` | 0 → 0.1 | 防止参数极端值 |
+| 参数 | 8B 当前值 | 调整方向 | 预期效果 |
+|---|---|---|---|
+| `gconfig.n_samples` | 8 | 8 → 16 | 增加采样多样性，reward 方差更小 |
+| `actor.optimizer.gradient_clipping` | 1.0 | 1.0 → 0.1 | 稳定训练，防止梯度爆炸 |
+| `actor.optimizer.lr` | 1e-6 | 1e-6 → 5e-7 | 更保守的更新 |
 
 **第二优先级（精细调整）：**
-| 参数 | 调整方向 | 预期效果 |
-|---|---|---|
-| `actor.optimizer.lr` | 1e-6 → 5e-7 | 更保守的更新，稳定性更好 |
-| `actor.optimizer.beta2` | 0.999 → 0.99 | 适合 RL 噪声梯度 |
-| `actor.behave_imp_weight_cap` | 5.0 → 2.0 | 更严格的 importance weight 裁剪 |
-| `actor.reward_scaling` | 10.0 → 1.0 | 使用原始 reward 信号 |
+| 参数 | 8B 当前值 | 调整方向 | 预期效果 |
+|---|---|---|---|
+| `actor.optimizer.beta2` | 0.999 | 0.999 → 0.99 | 适合 RL 噪声梯度 |
+| `actor.kl_ctl` | 0.001 | 0.001 → 0.0 | 移除 KL（DAPO 风格），允许更大策略更新 |
+| `actor.behave_imp_weight_cap` | 2.0 | 2.0 → 1.5 | 更严格的 importance weight 裁剪 |
 
 **第三优先级（架构调整）：**
-| 参数 | 调整方向 | 预期效果 |
-|---|---|---|
-| `gconfig.max_new_tokens` | 8192 → 16384 | 允许更长推理链 |
-| `rollout.max_head_offpolicyness` | 2 → 1 | 牺牲吞吐换取更 on-policy 的训练 |
+| 参数 | 8B 当前值 | 调整方向 | 预期效果 |
+|---|---|---|---|
+| `gconfig.max_new_tokens` | 8192 | 8192 → 16384 | 允许更长推理链 |
+| `rollout.max_head_offpolicyness` | 2 | 2 → 1 | 牺牲吞吐换取更 on-policy 的训练 |
 
-### 8.3 关键监控指标
+### 8.3 最容易踩的三个坑
+1. **题目太简单**：大部分题模型已经会了，reward 没梯度。需要分层（easy/medium/hard），确保训练集有足够"会一部分但做不稳"的题。
+2. **只看训练 reward**：训练 reward 在升不代表模型真的变强，可能只是学会了模板化输出。**一定要看独立验证集准确率。**
+3. **过度追求长 CoT**：不是越长越好。需要的是有效推理 + 可验证结果 + 稳定格式，不是把输出拉得特别长。
+
+### 8.4 关键监控指标
 | 指标 | 健康范围 | 异常信号 | 应对措施 |
 |---|---|---|---|
 | reward_mean | 持续上升 | 100 步内无上升 | 检查奖励函数；增加 n_samples |
@@ -406,21 +432,18 @@ bash fuyao_examples/fuyao_areal_run.sh \
 | DeepSeek-R1 | DeepSeek-V3 base | R1-Zero(GRPO) + SFT + RLVR + RLHF | AIME24: 79.8% | 大规模 |
 | Open-R1 | Qwen2.5-32B | SFT(OpenR1-Math) + GRPO | 匹配 R1 蒸馏模型 | 多节点 |
 
-### A.2 推荐路线（适用于当前项目）
-**路线 A（最快出结果，推荐）：**
+### A.2 当前选定路线（Qwen3-8B，聚焦 math 单任务打通闭环）
 ```
-Qwen3-4B instruct --> DAPO RL (dapo_math_17k, 500-2000 步)
-                      --> 评估 GSM8K/MATH/AIME
-                      --> Code DAPO / Search R1
+Qwen3-8B SFT checkpoint (已完成)
+  → Math RLVR (dapo_math_17k, GRPO, 2 节点 16GPU)
+  → 验证：reward 上升 + eval 准确率提升 + entropy 稳定
+  → 高奖励样本回灌 SFT（可选，提升下一轮 RL 起点）
+  → 扩展到 code RLVR（可验证 reward：unit test / compile）
+  → 扩展到 tool use（短 horizon）
+  → 最后进 agentic RL（多轮，长 horizon）
 ```
 
-**路线 B（更完整，base model 起步）：**
-```
-Qwen3-4B base --> SFT (OpenR1-Math-220k, 8-10 epoch)
-              --> DAPO RL (dapo_math_17k, 500-2000 步)
-              --> 评估
-              --> Code DAPO / Search R1
-```
+核心原则：**每次只加一个任务，跑稳后再扩展。先用 math 验证训练闭环。**
 
 ---
 
