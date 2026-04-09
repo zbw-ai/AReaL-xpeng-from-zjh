@@ -109,6 +109,17 @@ done
 # ========================== 5. 环境配置 ==========================
 echo "===== Step 2: Configure environment ====="
 
+# 多节点检测：Fuyao PyTorchJob 注入 Slurm 兼容环境变量
+#   NODE_RANK: 节点序号 (0 ~ NNODES-1)
+#   MASTER_ADDR: head 节点 IP
+#   SLURM_JOB_NUM_NODES: 总节点数
+NODE_RANK="${NODE_RANK:-0}"
+NUM_NODES="${SLURM_JOB_NUM_NODES:-1}"
+HEAD_ADDR="${MASTER_ADDR:-localhost}"
+GPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-8}"
+RAY_PORT=6379
+
+echo "Node rank: ${NODE_RANK}, Total nodes: ${NUM_NODES}, Head addr: ${HEAD_ADDR}, GPUs/node: ${GPUS_PER_NODE}"
 
 # NCCL 配置
 unset NCCL_NET_GDR_LEVEL 2>/dev/null || true
@@ -183,10 +194,14 @@ case "$RUN_TYPE" in
     math_rlvr)
         echo "[sandbox] Math RLVR does not require sandboxes"
         ;;
+    math_sft)
+        echo "[sandbox] Math SFT does not require sandboxes"
+        ;;
 esac
 
 # ========================== 7. run-type → Python 入口映射 ==========================
 declare -A LAUNCH_SCRIPTS=(
+    ["math_sft"]="fuyao_examples/math/train_math_sft.py"
     ["math_rlvr"]="fuyao_examples/math/train_math_rlvr.py"
     ["search_r1"]="fuyao_examples/search_r1/train_search_r1.py"
     ["code_dapo"]="fuyao_examples/code_dapo/train_code_dapo.py"
@@ -198,13 +213,82 @@ if [[ ! -f "${PROJECT_ROOT}/${LAUNCH_SCRIPT}" ]]; then
     exit 1
 fi
 
-# ========================== 8. 启动训练 ==========================
+# ========================== 8. Ray Cluster 启动（多节点时） ==========================
+
+# 判断是否需要 Ray：当 NUM_NODES > 1 时启动 Ray cluster
+USE_RAY=false
+if [[ "${NUM_NODES}" -gt 1 ]]; then
+    USE_RAY=true
+fi
+
+if $USE_RAY; then
+    echo "===== Step 4: Setting up Ray cluster (${NUM_NODES} nodes) ====="
+
+    # 通过 NFS 信号文件协调各节点退出，避免 worker 先于 head 退出导致 PyTorchJob 判定失败
+    # 使用共享存储路径（和 name_resolve/fileroot 同一 NFS），确保所有节点可见
+    RAY_SIGNAL_DIR="/dataset_rc_llmrl/zengbw1/areal_experiments/.ray_signals/${BIFROST_JOB_NAME:-default}"
+    mkdir -p "${RAY_SIGNAL_DIR}"
+
+    # 先停掉可能残留的 Ray
+    ray stop --force 2>/dev/null || true
+    sleep 2
+
+    if [[ "${NODE_RANK}" == "0" ]]; then
+        # Head 节点：清理旧信号文件
+        rm -f "${RAY_SIGNAL_DIR}/job_done"
+
+        echo "[ray] Starting Ray head on node 0..."
+        ray start --head --port=${RAY_PORT} --num-gpus=${GPUS_PER_NODE}
+
+        # 等待所有节点加入
+        echo "[ray] Waiting for all ${NUM_NODES} nodes to join..."
+        MAX_WAIT=300
+        ELAPSED=0
+        while true; do
+            JOINED=$(python3 -c "
+import ray
+ray.init(address='auto', ignore_reinit_error=True)
+nodes = [n for n in ray.nodes() if n.get('Alive', False)]
+print(len(nodes))
+ray.shutdown()
+" 2>/dev/null || echo "0")
+            if [[ "${JOINED}" -ge "${NUM_NODES}" ]]; then
+                echo "[ray] All ${NUM_NODES} nodes joined the Ray cluster."
+                break
+            fi
+            if [[ "${ELAPSED}" -ge "${MAX_WAIT}" ]]; then
+                echo "[ray] ERROR: Timed out waiting for nodes. Joined: ${JOINED}/${NUM_NODES}"
+                ray status 2>/dev/null || true
+                exit 1
+            fi
+            echo "[ray] Waiting... ${JOINED}/${NUM_NODES} nodes joined (${ELAPSED}s elapsed)"
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+        done
+    else
+        echo "[ray] Starting Ray worker on node ${NODE_RANK}, connecting to ${HEAD_ADDR}:${RAY_PORT}..."
+        sleep 10  # 给 head 节点时间启动
+        ray start --address="${HEAD_ADDR}:${RAY_PORT}" --num-gpus=${GPUS_PER_NODE}
+
+        echo "[ray] Worker node ${NODE_RANK} joined. Waiting for head to signal job completion..."
+        # 通过 NFS 信号文件等待 head 节点完成训练（比 ray status 更可靠）
+        while [[ ! -f "${RAY_SIGNAL_DIR}/job_done" ]]; do
+            sleep 10
+        done
+        echo "[ray] Job completed. Worker node ${NODE_RANK} exiting."
+        ray stop --force 2>/dev/null || true
+        exit 0
+    fi
+fi
+
+# ========================== 9. 启动训练 ==========================
 echo ""
 echo "================================================================"
 echo " AReaL Fuyao Training"
 echo " Type:    ${RUN_TYPE}"
 echo " Config:  ${CONFIG_PATH}"
 echo " Script:  ${LAUNCH_SCRIPT}"
+echo " Nodes:   ${NUM_NODES} (Ray: ${USE_RAY})"
 [[ "$RUN_TYPE" == "search_r1" ]] && echo " Search:  ${RETRIEVAL_ENDPOINT:-not set}"
 [[ "$RUN_TYPE" == "code_dapo" ]] && echo " Code:    ${EXECD_ENDPOINT:-local subprocess}"
 [[ -n "$SWANLAB_API_KEY" ]] && echo " Logger:  SwanLab enabled"
@@ -213,9 +297,28 @@ echo ""
 
 cd "$PROJECT_ROOT"
 
+# 多节点时自动注入 scheduler.type=ray 和 name_resolve.type=ray
+RAY_EXTRA_ARGS=()
+if $USE_RAY; then
+    RAY_EXTRA_ARGS=(
+        scheduler.type=ray
+        cluster.name_resolve.type=ray
+    )
+fi
+
 python3 "${LAUNCH_SCRIPT}" \
     --config "${CONFIG_PATH}" \
+    "${RAY_EXTRA_ARGS[@]+"${RAY_EXTRA_ARGS[@]}"}" \
     "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; exit_code=$?
+
+# 清理 Ray 并通知 worker 节点退出
+if $USE_RAY; then
+    echo "[ray] Signaling worker nodes to exit..."
+    touch "${RAY_SIGNAL_DIR}/job_done"
+    sleep 5  # 给 worker 节点时间读到信号
+    echo "[ray] Stopping Ray cluster..."
+    ray stop --force 2>/dev/null || true
+fi
 
 echo "Training finished with exit code: ${exit_code}"
 exit ${exit_code}
