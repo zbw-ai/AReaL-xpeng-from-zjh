@@ -206,7 +206,7 @@ reward = 1.0 if extracted_answer == ground_truth else 0.0
 
 ### 6.4 AReaL 训练配置（qwen3_8b_rlvr.yaml）
 
-![AReaL RLVR Architecture](images/02_rlvr_architecture.png)
+![AReaL RLVR Architecture](./02_rlvr_architecture.png)
 
 **集群资源（2 节点 × 8 GPU）：**
 | 角色 | GPU 数 | 节点 | 并行策略 |
@@ -267,7 +267,7 @@ reward = 1.0 if extracted_answer == ground_truth else 0.0
 
 ### 6.8 DAPO 进阶调整（效果不好时再考虑）
 
-![DAPO vs GRPO](images/03_dapo_vs_grpo.png)
+![DAPO vs GRPO](./03_dapo_vs_grpo.png)
 
 当前配置使用 GRPO（kl_ctl=0.001），更保守稳定。如果想进一步提升，可尝试 DAPO：
 | DAPO 技术 | 调整 | 说明 |
@@ -279,7 +279,7 @@ reward = 1.0 if extracted_answer == ground_truth else 0.0
 
 ### 6.9 超参调优优先级
 
-![Hyperparameter Tuning Priority](images/06_hyperparam_priority.png)
+![Hyperparameter Tuning Priority](./06_hyperparam_priority.png)
 
 **第一优先级：**
 | 参数 | 当前值 | 调整方向 |
@@ -433,7 +433,7 @@ bash fuyao_examples/fuyao_areal_run.sh \
 
 ### 10.5 监控指标速查表
 
-![Monitoring Dashboard](images/05_monitoring.png)
+![Monitoring Dashboard](./05_monitoring.png)
 
 | 指标 | 健康范围 | 异常信号 | 应对措施 |
 |---|---|---|---|
