@@ -39,10 +39,43 @@ Qwen3-8B-Base (M1)
 ## 3. 数据资产
 
 ### 3.1 训练数据
-| 数据集 | 路径 | 规模 | 说明 |
-|---|---|---|---|
-| deepmath_math_rule_20k | `/workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet` | ~20K | RL 训练主题池，硬数学题 |
-| dapo_math_17k | `/workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed` | ~17K | 已集成到 AReaL 的训练数据 |
+| 数据集 | 用途 | 路径 | 规模 | 格式 | 说明 |
+|---|---|---|---|---|---|
+| OpenThoughts3-1.2M | SFT | `/workspace/chenj81@xiaopeng.com/tyzn/dyymx/training_data/sft/OpenThoughts3-1_2M/train` | 456K (16 parquet files) | `messages` 格式: system + user + assistant (含 `<think>` 推理链) | QwQ-32B 标注的高质量推理轨迹，850K 数学 + 250K 代码 + 100K 科学。SFT 学"怎么写推理链" |
+| deepmath_math_rule_20k | RLVR | `/workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet` | 19982 | `prompt` (messages 列表) + `reward_model.ground_truth` (答案) | 硬数学题，无 solution 列，只有题目和答案。RLVR 学"怎么做对"：模型自己探索，verifier 判对错 |
+| dapo_math_17k | RLVR (备选) | `/workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed` | ~17K | `prompt` + `solution` (含 `\boxed{}`) | 已集成到 AReaL 的训练数据 |
+
+### 3.1.1 数据分工原则 (2026-04-09 确认)
+- **SFT 学"怎么写"**：需要高质量的完整推理轨迹作为模仿对象 → OpenThoughts3（有详细推理链）
+- **RLVR 学"怎么做对"**：只需要题目 + 答案，模型自己探索解法，对错由 reward 判断 → deepmath_20k（硬题，有区分度）
+- **不要混用**：SFT 数据不该给 RLVR（会变成模仿学习而非探索学习），RLVR 数据不该给 SFT（没有推理过程可模仿）
+
+### 3.1.2 数据格式实测 (bifrost-2026040910373400-zengbw1)
+**OpenThoughts3 样本结构**：
+```json
+{
+  "data_source": "open-thoughts/OpenThoughts3-1.2M",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "I am in desperate need of some ear defenders..."},
+    {"role": "assistant", "content": "<think>\nOkay, I need to solve...\n</think>\n\nHere is the solution..."}
+  ],
+  "extra_info": {"difficulty": 7, "domain": "code", "source": "stackexchange_codegolf"}
+}
+```
+dataset_sft.py 自动检测 `messages` 列 → 直接使用，无需格式转换。
+
+**deepmath_20k 样本结构**：
+```json
+{
+  "data_source": "math_rule",
+  "prompt": [{"role": "user", "content": "Solve the following math problem..."}],
+  "ability": "math",
+  "reward_model": {"ground_truth": "1", "style": "rule"},
+  "extra_info": {"answer": "1", "difficulty": 10, "question": "Determine whether..."}
+}
+```
+注意：`prompt` 是 messages 列表格式（非纯文本），无 `solution` 列。当前 RLVR 配置使用 dapo_math_17k；如需切换到 deepmath_20k，需适配 RL dataset loader。
 
 ### 3.2 评测数据
 | 数据集 | 路径/来源 | 题数 | 难度 | 角色 |
