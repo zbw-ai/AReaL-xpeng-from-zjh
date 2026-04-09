@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 --run-type <type> --config <yaml> [options]"
             echo ""
             echo "Required:"
-            echo "  --run-type        Training type: math_rlvr, search_r1, code_dapo"
+            echo "  --run-type        Training type: math_sft, math_rlvr, search_r1, code_dapo"
             echo "  --config          Path to YAML config file"
             echo ""
             echo "Options:"
@@ -72,7 +72,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ========================== 3. 参数校验 ==========================
-VALID_RUN_TYPES=("math_rlvr" "search_r1" "code_dapo")
+VALID_RUN_TYPES=("math_sft" "math_rlvr" "search_r1" "code_dapo")
 if [[ -z "$RUN_TYPE" ]]; then
     echo "Error: --run-type is required (${VALID_RUN_TYPES[*]})"
     exit 1
