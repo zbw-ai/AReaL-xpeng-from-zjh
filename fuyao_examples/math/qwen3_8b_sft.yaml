@@ -64,12 +64,14 @@ actor:
       env_vars: {}
 
 # ── Datasets ──
+# Default: OpenThoughts3-1.2M (conversations format, auto-detected)
+# Override: --train_dataset.path=/path/to/other/data
 train_dataset:
   batch_size: 8
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  path: /workspace/chenj81@xiaopeng.com/tyzn/dyymx/training_data/sft/OpenThoughts3-1_2M/train
   type: sft
   max_length: 8192
 
@@ -77,7 +79,7 @@ valid_dataset:
   batch_size: 8
   pin_memory: true
   num_workers: 4
-  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  path: /workspace/chenj81@xiaopeng.com/tyzn/dyymx/training_data/sft/OpenThoughts3-1_2M/train
   type: sft
   max_length: 8192
 
