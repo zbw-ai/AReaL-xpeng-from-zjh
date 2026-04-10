@@ -99,31 +99,48 @@ dataset_sft.py 自动检测 `messages` 列 → 直接使用，无需格式转换
 
 ## 4. P0 基线评测
 
-### 4.1 评测矩阵
-| DataSet \ Model | qwen3-8b-base (M1) | qwen3-8b-instruct (M2) | qwen3-8b-sft3905 (M3) | qwen3-8b-sft4450 (M4) |
+### 4.1 评测矩阵（P0 完成，2026-04-09）
+| DataSet \ Model | qwen3-8b-base (M1) | qwen3-8b-sft3905 (M3) | qwen3-8b-sft4450 (M4) | qwen3-8b-instruct (M2) |
 |---|---|---|---|---|
-| gsm8k | | | | |
-| math_500 | | | | |
-| aime_2024 | | | | |
-| aime_2025 | | | | |
-| gpqa_diamond | | | | |
-| livecodebench_v5 | | | | |
+| AIME 2024 | 12.08% | 72.08% | 71.25% | 79.58% |
+| AIME 2025 | 8.75% | 53.75% | 65.00% | 70.83% |
+| GPQA Diamond | 29.23% | 57.83% | 56.57% | 61.55% |
+| GSM8K | 81.50% | 95.00% | 94.77% | 95.38% |
+| LiveCodeBench v5 | 15.21% | 43.75% | 48.19% | 55.65% |
+| Math 500 | 61.08% | 93.60% | 94.98% | 94.43% |
+| 平均 Accuracy | 34.64% | 69.33% | 71.79% | 76.24% |
 
-### 4.2 评测设置
-| 参数 | 值 | 说明 |
-|---|---|---|
-| 推理模式 | thinking (M2); standard (M1/M3/M4) | M2 有 thinking 模式，需测两种 |
-| temperature | 0.0 (greedy) | 基线用 greedy，pass@k 用高温 |
-| max_new_tokens | 8192 | 与 RLVR 配置一致 |
-| 答案提取 | `\boxed{}` | 使用 math_verify 验证 |
+### 4.2 评测分析
+**Q1: 哪个模型做 RL 起点最好？**
+→ **Instruct (M2)**。平均 76.24%，全面最高。AIME24 79.58% 比 POLARIS 的 baseline (73.8%) 还高。
 
-### 4.3 关键问题（评测后回答）
-1. **哪个模型做 RL 起点最好？** 看 aime_2024 + math_500 的综合表现
-2. **SFT 是否有效？** 比较 M1 vs M3/M4，SFT 带来多少提升
-3. **Instruct vs SFT？** 比较 M2 vs M4，谁更适合做 RL 起点
-4. **SFT 训练是否饱和？** 比较 M3 vs M4，step 3905→4450 是否还有提升
-5. **格式合规率？** 各模型 `\boxed{}` 出现率是否 > 95%
-6. **基础能力如何？** GSM8K 作为底线，所有模型应该 > 80%
+**Q2: SFT 是否有效？**
+→ 非常有效。Base → SFT: 34.64% → 71.79% (+37.15%)，AIME24 从 12% 到 71%（+59%）。
+
+**Q3: Instruct vs SFT-4450？**
+→ Instruct 全面领先（+4.45% avg），但 Math 500 上 SFT-4450 反超（94.98% vs 94.43%）。纯数学能力接近持平，Instruct 在推理泛化（GPQA）和代码（LiveCode）上更强。
+
+**Q4: SFT 训练是否饱和？**
+→ 接近饱和。3905→4450 在 AIME25 上 +11.25%（大幅提升），但 AIME24 -0.83%（微降）。继续训练预期收益递减。
+
+**Q5: 格式合规率？**
+→ 所有后训练模型 GSM8K > 94%，格式基本稳定。[待补充] `\boxed{}` 专项检查。
+
+**Q6: 基础能力如何？**
+→ 所有后训练模型 GSM8K > 94%，基础能力无问题。Base 的 81.50% 也在可接受范围。
+
+### 4.3 模型选择决策
+**选定：Qwen3-8B Instruct (M2) 作为 P3 RLVR 起点。跳过 P1 SFT。**
+
+理由：
+1. pass@1 全面最高（76.24% avg, AIME24 79.58%）
+2. POLARIS 用同类起点验证了 Instruct → 直接 RL 有效
+3. 格式最稳（原生 thinking 模式 + `\boxed{}`），RL 崩坏风险最低
+4. 失败成本低——切到 SFT-4450 只需改 `actor.path`
+
+回退条件：
+- RL 100 步后 reward 不升 + entropy collapse → 切 SFT-4450
+- SFT-4450 路径: `/dataset_rc_b1/llm_train_sft/lijl42/SFT_Qwen3_8B_Base/qwen3_8b_base_ot3_sft_0105/global_step_4450/huggingface`
 
 ---
 
@@ -230,9 +247,10 @@ fuyao deploy --disable-fault-tolerance \
 
 ### Run 0: P0 基线评测
 - **日期**：2026-04-09
-- **状态**：进行中
+- **状态**：完成
 - **内容**：4 个模型 × 6 个数据集 = 24 组评测
-- **结果**：[待填入]
+- **结果**：见 4.1 评测矩阵
+- **结论**：选定 Instruct (76.24% avg) 作为 RL 起点，跳过 P1 SFT，直接进 P3
 
 ---
 
@@ -241,7 +259,7 @@ fuyao deploy --disable-fault-tolerance \
 | 日期 | 决策 | 理由 | 状态 |
 |---|---|---|---|
 | 2026-04-09 | 聚焦 Qwen3-8B，math 单任务先行 | 最快打通闭环，math reward 最干净 | 确认 |
-| 2026-04-09 | 默认从 Instruct 起步 | POLARIS 验证可行；格式稳定性好；调试范围小 | 待 P0 数据确认 |
+| 2026-04-09 | 选定 Instruct 作为 RL 起点，跳过 P1 SFT | P0 数据确认：Instruct 76.24% avg 全面最高；POLARIS 验证同类路线有效；回退方案：切 SFT-4450 | 确认 |
 | 2026-04-09 | aime_2024 作为训练验证集 | 30 题，eval 成本低，业界对标指标 | 确认 |
 | 2026-04-09 | 6 数据集评测体系 | gsm8k(底线) + math_500(主指标) + aime(对标) + gpqa(泛化) + livecode(code 监控) | 确认 |
 | 2026-04-09 | SFT 用 OpenThoughts3，RLVR 用 deepmath_20k | SFT 学"怎么写"需要推理链；RLVR 学"怎么做对"只需题目+答案 | 确认 |
