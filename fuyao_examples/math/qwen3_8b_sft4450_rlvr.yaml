@@ -157,7 +157,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 10000
+  freq_steps: 100
   freq_secs: null
 
 recover:
