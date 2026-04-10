@@ -193,9 +193,9 @@ perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  enabled: true
+  enabled: false
   save_interval: 1
-  profile_steps: [10]
+  profile_steps: []
   session_tracer:
     enabled: true
     flush_threshold: 256
