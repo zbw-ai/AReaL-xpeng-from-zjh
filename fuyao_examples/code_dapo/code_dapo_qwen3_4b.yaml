@@ -30,10 +30,10 @@ system_prompt: >-
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/files
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
   name_resolve:
     type: nfs
-    nfs_record_root: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/name_resolve
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
 
 scheduler:
   type: local

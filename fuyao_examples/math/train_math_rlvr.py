@@ -5,6 +5,7 @@ Usage:
         --config fuyao_examples/math/qwen3_4b_rlvr.yaml
 """
 
+import os
 import sys
 
 from areal import PPOTrainer
@@ -46,11 +47,13 @@ def main(args):
     # Apply DeepInsight metric mapping before training
     apply_tracking_patch()
 
+    enable_thinking = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
+
     workflow_kwargs = dict(
         reward_fn="fuyao_examples.reward.math_reward_fn",
         gconfig=config.gconfig,
         tokenizer=config.tokenizer_path,
-        enable_thinking=False,
+        enable_thinking=enable_thinking,
     )
     eval_workflow_kwargs = workflow_kwargs.copy()
     eval_workflow_kwargs["gconfig"] = config.gconfig.new(temperature=0.6)

@@ -1,24 +1,50 @@
-# Qwen3 8B Math RLVR — Instruct → GRPO on dapo_math_17k
-# P3 experiment: Instruct as RL starting point (P0 evaluation confirmed)
-#   - Model: Qwen3-8B Instruct (76.24% avg, AIME24 79.58%)
-#   - Training: Megatron (DP2×TP2×PP2), 2 nodes (1T + 1R isolated)
-#   - Inference: SGLang (DP4 × TP2)
-#   - Algorithm: GRPO with KL regularization (kl_ctl=0.001)
-#   - Data: dapo_math_17k (train) + aime_2024 (eval every 20 steps)
-#   - Cluster: 2 nodes × 8 GPU = 16 GPU (A100 80G)
-#   - Fallback: SFT-4450 at actor.path=/.../global_step_4450/huggingface
+# Qwen3 8B Math RLVR — GRPO on dapo_math_17k
+#
+# Model: Qwen3-8B (default: Instruct, override via model_tag + actor.path)
+#   - instruct: /dataset_rc_b1/models/Qwen3-8B (default)
+#   - sft4450:  /dataset_rc_b1/llm_train_sft/lijl42/SFT_Qwen3_8B_Base/qwen3_8b_base_ot3_sft_0105/global_step_4450/huggingface
+#   - base:     /publicdata/huggingface.co/Qwen/Qwen3-8B-Base
+#
+# Training: Megatron (DP2×TP2×PP2), 2 nodes (1T + 1R isolated)
+# Inference: SGLang (DP4 × TP2)
+# Algorithm: GRPO with KL regularization (kl_ctl=0.001)
+# Data: dapo_math_17k (train) + aime_2024 (eval every 20 steps)
+# Cluster: 2 nodes × 8 GPU = 16 GPU (A100 80G)
 #
 # GPU layout (16 GPUs):
 #   Actor  (8 GPU, node 0): megatron:d2t2p2 = DP2 × TP2 × PP2
 #   SGLang (8 GPU, node 1): sglang:d4p1t2  = DP4 × TP2
 #   Ref: colocated with actor
 #
+# Env vars:
+#   MODEL_TAG     — experiment_name suffix (default: instruct)
+#   ENABLE_THINKING — enable Qwen3 thinking mode (default: false)
+#
 # Usage:
+#   # Instruct (default, no thinking)
 #   bash fuyao_examples/fuyao_areal_run.sh \
 #       --run-type math_rlvr \
 #       --config fuyao_examples/math/qwen3_8b_rlvr.yaml
+#
+#   # Instruct + thinking
+#   MODEL_TAG=instruct-think ENABLE_THINKING=true \
+#   bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_8b_rlvr.yaml
+#
+#   # SFT-4450
+#   MODEL_TAG=sft4450 bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_8b_rlvr.yaml \
+#       actor.path=/dataset_rc_b1/llm_train_sft/lijl42/SFT_Qwen3_8B_Base/qwen3_8b_base_ot3_sft_0105/global_step_4450/huggingface
+#
+#   # Base
+#   MODEL_TAG=base bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_8b_rlvr.yaml \
+#       actor.path=/publicdata/huggingface.co/Qwen/Qwen3-8B-Base
 
-experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-8b-math-rlvr
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-8b-${oc.env:MODEL_TAG,instruct}-rlvr
 trial_name: trial0
 
 seed: 42

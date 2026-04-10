@@ -21,10 +21,10 @@ tokenizer_path: ${actor.path}
 cluster:
   n_nodes: 1
   n_gpus_per_node: 8
-  fileroot: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/files
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
   name_resolve:
     type: nfs
-    nfs_record_root: /dataset_rc_llmrl/areal_zjh_output/${experiment_name}/name_resolve
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
 
 scheduler:
   type: local
@@ -192,6 +192,9 @@ perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  enabled: false
+  enabled: true
+  save_interval: 1
+  profile_steps: [10]
   session_tracer:
-    enabled: false
+    enabled: true
+    flush_threshold: 256

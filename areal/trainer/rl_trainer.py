@@ -375,6 +375,7 @@ class PPOTrainer:
                     perf_tracer.trace_scope(
                         "train.recompute_logp",
                         category=Category.COMPUTE,
+                        enable_profiler=True,
                         args={"global_step": global_step},
                     ),
                 ):
@@ -434,6 +435,7 @@ class PPOTrainer:
                 perf_tracer.trace_scope(
                     "train.ppo_update",
                     category=Category.COMPUTE,
+                    enable_profiler=True,
                     args={"global_step": global_step},
                 ),
             ):
@@ -590,6 +592,10 @@ class PPOTrainer:
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
         elif cfg.type == "ray":
+            import ray
+
+            if not ray.is_initialized():
+                ray.init(ignore_reinit_error=True)
             return RayScheduler(exp_config=self.config)
         elif cfg.type == "slurm":
             return SlurmScheduler(exp_config=self.config)

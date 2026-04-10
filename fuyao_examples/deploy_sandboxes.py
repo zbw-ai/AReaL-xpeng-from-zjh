@@ -43,7 +43,7 @@ CODE_IMAGE = "infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:
 DEFAULT_SITE = "fuyao_b1"
 DEFAULT_GPU_PARTITION = "rc-llmrl-a100"
 DEFAULT_CPU_PARTITION = "rc-cpu"
-DEFAULT_EXPERIMENT = "zhangjh37/llm_rl"
+DEFAULT_EXPERIMENT = "zengbw1/llm_rl"
 
 SEARCH_PORT = 8001
 EXECD_PORT = 39524
