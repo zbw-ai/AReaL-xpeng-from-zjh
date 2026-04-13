@@ -78,6 +78,8 @@ LOGGER_COLORS_EXACT = {
     "Geometry3KReward": "purple",
     "RewardUtils": "purple",
     "RewardAPI": "purple",
+    # FLOPs counter - green (data/metrics)
+    "FlopsCounter": "light_green",
     # Tree attention - cyan
     "TreeAttentionWrapper": "light_cyan",
     "TreeAttentionFSDP": "light_cyan",
