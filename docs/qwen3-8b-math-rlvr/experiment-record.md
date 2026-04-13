@@ -292,11 +292,115 @@ fuyao deploy --disable-fault-tolerance \
 4. ② 和 ③ 表现完全一致（reward、incorrect 数量都相同），说明两种起点 + CoT 等效
 5. ① 速度最快但效果最差——Instruct 不开 thinking 做 RLVR 不可行
 
+### Run 2 训练最终状态 (2026-04-13 确认)
+三个训练任务全部结束：
+
+| 实验 | 最终状态 | 总步数 | Checkpoints |
+|---|---|---|---|
+| ① Instruct (no think) | JOB_FAILED | ~1261 步 | 13 个 (step 99~1199) |
+| ② SFT-4450 (no think) | JOB_COMPLETE | ~2174 步 (2 epochs) | 23 个 (step 99~2173) |
+| ③ Instruct + think | JOB_RUNNING (仍在跑) | ~2045+ 步 | 21+ 个 (step 99~1999+) |
+
+**三个实验全部训崩**——reward 在 step ~500-600 后持续下降至 0：
+
+| 实验 | 稳定区间 | 峰值 reward | 崩溃起点 | 崩溃原因 |
+|---|---|---|---|---|
+| ① Instruct nothink | step 1-400 | 0.39 | step ~500 | entropy 0.6→9.6 (爆炸) |
+| ② SFT-4450 | step 1-500 | 0.51 | step ~600 | entropy 0.7→5.3 (爆炸) |
+| ③ Instruct+think | step 1-500 | 0.57 | step ~600 | entropy 0.3→8.2 (爆炸) |
+
+**训练 reward 曲线 (每 100 步采样)：**
+
+③ Instruct+think:
+| step | rollout_reward | task_reward | entropy | incorrect/128 |
+|---|---|---|---|---|
+| 1 | 0.6198 | 0.8281 | 0.2761 | 22 |
+| 100 | 0.4833 | 0.5703 | 0.2944 | 55 |
+| 200 | 0.5208 | 0.8047 | 0.2766 | 25 |
+| 300 | 0.5667 | 0.7734 | 0.3254 | 29 |
+| 400 | 0.5500 | 0.8750 | 0.3384 | 16 |
+| 500 | 0.5500 | 0.7266 | 0.5741 | 35 |
+| 600 | 0.4750 | 0.5312 | 1.3836 | 60 |
+| 700 | 0.1167 | 0.0781 | 3.1435 | 118 |
+| 1000 | 0.1375 | 0.2656 | 4.2178 | 94 |
+| 2000 | 0.1208 | 0.0625 | 4.5011 | 120 |
+
+② SFT-4450:
+| step | rollout_reward | task_reward | entropy | incorrect/128 |
+|---|---|---|---|---|
+| 1 | 0.4844 | 0.7656 | 0.5646 | 30 |
+| 100 | 0.4250 | 0.4531 | 0.6281 | 70 |
+| 200 | 0.4333 | 0.8594 | 0.4918 | 18 |
+| 300 | 0.4708 | 0.6016 | 0.6494 | 51 |
+| 400 | 0.5125 | 0.7344 | 0.5932 | 34 |
+| 500 | 0.4917 | 0.7109 | 0.7097 | 37 |
+| 600 | 0.5000 | 0.4609 | 1.9724 | 69 |
+| 800 | 0.1167 | 0.2500 | 3.7379 | 96 |
+| 1200 | 0.0000 | 0.0000 | 0.5040 | 128 |
+| 2000 | 0.0000 | 0.0312 | 0.2526 | 124 |
+
+### Run 2 评测结果 (DeepInsight, 6 数据集)
+
+**③ Instruct+think 训练曲线评测：**
+| 数据集 | P0 基线 | step 99 | step 199 | step 499 | 最佳 step |
+|---|---|---|---|---|---|
+| AIME 2024 | 79.58% | 80.83% (+1.25) | 77.92% (-1.66) | 72.92% (-6.66) | 99 |
+| AIME 2025 | 70.83% | 70.00% (-0.83) | 70.83% (0.00) | 63.33% (-7.50) | 199 |
+| GPQA Diamond | 61.55% | 61.36% (-0.19) | 62.31% (+0.76) | 59.34% (-2.21) | 199 |
+| GSM8K | 95.38% | 95.91% (+0.53) | 96.29% (+0.91) | 95.83% (+0.45) | 199 |
+| LiveCodeBench v5 | 55.65% | 56.33% (+0.68) | 56.63% (+0.98) | 53.69% (-1.96) | 199 |
+| Math 500 | 94.43% | 94.15% (-0.28) | 94.45% (+0.02) | 93.88% (-0.55) | 199 |
+| 平均 | 76.24% | 76.43% (+0.19) | 76.40% (+0.16) | 73.16% (-3.08) | **99** |
+
+**② SFT-4450 step 199 评测：**
+| 数据集 | P0 基线 (SFT-4450) | step 199 | Δ |
+|---|---|---|---|
+| AIME 2024 | 71.25% | 70.00% | -1.25% |
+| AIME 2025 | 65.00% | 61.25% | -3.75% |
+| GPQA Diamond | 56.57% | 55.49% | -1.08% |
+| GSM8K | 94.77% | 95.00% | +0.23% |
+| LiveCodeBench v5 | 48.19% | 44.50% | -3.69% |
+| Math 500 | 94.98% | 94.30% | -0.68% |
+| 平均 | 71.79% | 70.09% | -1.70% |
+
+**待完成评测：**
+| 评测 | 状态 |
+|---|---|
+| ① Instruct nothink step 100 | RUNNING |
+| ① Instruct nothink step 200 | RUNNING |
+| ① Instruct nothink step 500 | RUNNING |
+| ② SFT-4450 step 100 | RUNNING |
+| ② SFT-4450 step 500 | RUNNING |
+
 ### Run 2 结论
-- **停掉 ①**（Instruct no think）：reward 持续下降，无继续价值
-- **继续 ② 和 ③**：等待 AIME 2024 eval 结果（每 20 步），对比泛化能力
-- **SFT-4450 不需要开 thinking**：已经自发 CoT
-- **下一步**：观察 ② vs ③ 长期趋势，挑选胜者做完整训练（epoch 改回 10）
+1. **RL 在 dapo_math_17k 上几乎无正向效果**：最佳 checkpoint (③ step 99) 仅比基线高 +0.19% avg，AIME24 +1.25%（可能在误差范围内）
+2. **step 200 后持续退化**：所有指标下降，step 499 时平均 -3.08%
+3. **三个实验全部在 step ~500-600 entropy 爆炸后崩溃**
+4. **根本原因：训练集太简单**——Instruct 在 dapo_math_17k 上 step 1 task_reward=0.83（128 样本中 106 个做对），GRPO group 内 advantage 几乎无区分度
+5. **最佳模型是 ③ Instruct+think step 99**（76.43% avg, AIME24 80.83%），但提升微弱
+6. **SFT-4450 全面退化**，RL 没有帮助
+
+### Run 3: deepmath_20k 实验 (2026-04-13, 进行中)
+基于 Run 2 结论，切换到更难的 deepmath_20k 数据集：
+
+| 配置 | 值 |
+|---|---|
+| Job | `bifrost-2026041311175401-zengbw1` |
+| 模型 | Qwen3-8B Instruct + thinking |
+| 训练数据 | deepmath_math_rule_20k (19982 题, difficulty=10) |
+| 验证集 | aime_2024 |
+| 其余超参 | 与 Run 2 ③ 相同 (GRPO, kl=0.001, temp=0.99) |
+| 状态 | RUNNING (~66 步) |
+
+**初步数据 (step 1-66)：**
+| 指标 | dapo_math (Run 2 ③) | deepmath (Run 3) | 对比 |
+|---|---|---|---|
+| step 1 task_reward | 0.83 (太高) | 0.19 (偏低但可接受) | 难度大幅提升 |
+| entropy (step 1-66) | 0.28→爆炸 | 0.31-0.36 (稳定) | 没有 entropy 爆炸 |
+| reward 趋势 | 先降后崩 | 震荡，未见明显上升 | 尚无正向信号 |
+| incorrect/128 | 18-30 | 94-117 | 大部分题做错 |
+
+**观察：** deepmath 难度合适但偏高，entropy 稳定是好消息。需要继续观察到 200+ 步看是否出现上升趋势。如果 reward 持续不升，可能需要：混合 dapo_math (简单) + deepmath (难) 构造理想难度分布，或提高 n_samples (8→16)。
 
 ---
 
@@ -314,44 +418,40 @@ fuyao deploy --disable-fault-tolerance \
 | 2026-04-09 | 提交 SFT 任务 | job: bifrost-2026040915445800-zengbw1，Qwen3-8B Instruct + OpenThoughts3，单节点 8×A100 | 完成 |
 | 2026-04-10 | Instruct 必须开 thinking 才能做 RLVR | 实验 ① 证明 no-think Instruct reward 持续下降（0.47→0.40），模型变长但不变好；开 thinking 后 reward 追平 SFT-4450 (0.594) | **确认** |
 | 2026-04-10 | SFT-4450 不需要开 thinking | SFT-4450 已自发 CoT (response 6.5k)，reward 与 Instruct+think 一致 (0.594)；开 thinking 只会增加序列长度和训练成本 | **确认** |
-| 2026-04-10 | 并行实验 ② SFT-4450 和 ③ Instruct+think | 两者当前表现完全一致，需要更多步数 + AIME eval 数据才能区分；winner 做完整 10 epoch 训练 | 进行中 |
+| 2026-04-10 | 并行实验 ② SFT-4450 和 ③ Instruct+think | 两者当前表现完全一致，需要更多步数 + AIME eval 数据才能区分；winner 做完整 10 epoch 训练 | 完成（见 Run 2 评测） |
 | 2026-04-10 | valid_dataset 从 dapo_math 改为 aime_2024 | 原来 train/valid 用同一数据，无法评估泛化；aime_2024 (30 题) 作为独立 eval set | 确认 |
 | 2026-04-10 | model_tag 和 enable_thinking 改为环境变量可配 | 一份 yaml 支持多模型 × 多配置，部署命令区分实验；`MODEL_TAG` 控制命名，`ENABLE_THINKING` 控制推理模式 | 确认 |
+| 2026-04-13 | dapo_math_17k 对 Instruct 太简单，无法有效训练 | step 1 task_reward=0.83（正确率 83%），GRPO group advantage 无区分度；三组实验全部 entropy 爆炸后崩溃；最佳 ckpt (step 99) 仅 +0.19% avg | 确认 |
+| 2026-04-13 | 切换到 deepmath_20k 数据集 | difficulty=10 硬题，step 1 task_reward=0.19（正确率 19%），难度区间合理但偏高；entropy 66 步内稳定（0.31-0.36），未爆炸 | 进行中 |
+| 2026-04-13 | ③ Instruct+think step 99 是当前最佳模型 | 76.43% avg, AIME24 80.83%（比基线 +1.25%），但提升微弱可能在误差范围 | 确认 |
 
 ---
 
 ## 8. 下一步计划
 
-### 短期（1-2 天）
-1. **观察 ② vs ③ 的 AIME 2024 eval 结果**
-   - evaluator 每 20 步触发，预计 ② 已有 4 次 eval，③ 有 2 次
-   - 比较泛化表现（AIME 2024 accuracy）
-   - 如果差距不大，选训练速度更快的（② SFT-4450, ~2.3 min/step vs ③ ~2.8 min/step）
+### 短期（进行中）
+1. **观察 Run 3 (deepmath_20k) 训练趋势**
+   - 等到 step 200+，看 reward 是否出现上升趋势
+   - 关注 entropy 是否继续稳定（目前 66 步稳定在 0.31-0.36）
+   - 如果 task_reward 从 0.19 上升到 0.25+，说明模型在学习
 
-2. **停掉 ① Instruct (no think)**
-   - 已确认不可行，释放 GPU 资源
+2. **完成剩余评测**
+   - ① nothink step 100/200/500, ② sft4450 step 100/500 仍在跑
+   - 补全对比表，完善数据闭环
 
-3. **挑选 winner，改 `total_train_epochs: 10` 做完整训练**
-   - 预计 1 epoch ≈ 1087 步 × 2.5 min ≈ 45 小时
-   - 10 epoch ≈ 19 天，可先跑 2-3 epoch 看趋势
+3. **Run 3 如果 reward 不升，考虑以下调整**（只改一个变量）：
+   - **方案 A**: 混合数据——dapo_math (简单, reward~0.83) + deepmath (难, reward~0.19) 构造 0.3-0.5 的理想区间
+   - **方案 B**: 增加 n_samples (8→16)——给难题更多采样机会，提高 group 内正确样本概率
+   - **方案 C**: 调超参——gradient_clipping 1.0→0.1, lr 1e-6→5e-7
 
-### 中期（1-2 周）
-4. **阶段结束全量评测**（6 数据集）
-   - 2 epoch 训练完成后，保存 checkpoint
-   - 跑 gsm8k + math_500 + aime_2024 + aime_2025 + gpqa + livecode
-
-5. **尝试切 DAPO 算法**
-   - 如果 GRPO reward 平台期（>100 步不涨），切 DAPO
-   - 只需改 yaml：`eps_clip_higher: 0.28`, `kl_ctl: 0.0`, `mask_no_eos_with_zero: true`, `dynamic_bs: true`
-
-6. **尝试 deepmath_20k 数据**
-   - dapo_math_17k 效果稳定后，切到更难的 deepmath_20k 看是否继续提升
+### 中期
+4. **deepmath 跑稳后做全量评测** (6 数据集)
+5. **尝试 DAPO 算法**——当前 GRPO 的 entropy 管控明显不足，DAPO 的 Clip-Higher + Dynamic Sampling 可能更合适
+6. **尝试 POLARIS 风格配置**——高温 (1.4)、无 KL、数据过滤 (移除通过率>90% 的题)
 
 ### 长期
-7. **轨迹筛选回灌**（P4）
-   - 从 RLVR checkpoint 采样正确轨迹 → SFT 回灌 → 二轮 RLVR
-8. **扩展到 code 任务**（P6）
-   - 验证 math RLVR 的收益是否迁移到 code
+7. **轨迹筛选回灌** (P4)——从最佳 RLVR checkpoint 采样正确轨迹 → SFT 回灌
+8. **扩展到 code 任务** (P6)
 
 ---
 
