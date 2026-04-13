@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+import time as _time
 from collections.abc import Callable
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
@@ -45,7 +46,9 @@ from areal.utils import logging, perf_tracer, seeding, stats_tracker
 from areal.utils.dataloader import create_dataloader
 from areal.utils.environ import is_single_controller
 from areal.utils.evaluator import Evaluator
+from areal.utils.flops_counter import FlopsCounter
 from areal.utils.hf_utils import load_hf_processor_and_tokenizer
+from areal.utils.perf_metrics import PerfMetrics
 from areal.utils.perf_tracer import Category
 from areal.utils.recover import RecoverHandler
 from areal.utils.saver import Saver
@@ -289,6 +292,9 @@ class PPOTrainer:
 
         self._config_perf_tracer()
 
+        # Initialize throughput/MFU metrics
+        self._perf_metrics = self._init_perf_metrics()
+
     def train(
         self,
         workflow: WorkflowLike | None = None,
@@ -335,6 +341,7 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
+            _t_rollout_start = _time.perf_counter()
             with (
                 stats_tracker.record_timing("rollout"),
                 perf_tracer.trace_scope(
@@ -354,6 +361,7 @@ class PPOTrainer:
                     group_size=config.gconfig.n_samples,
                     dynamic_bs=self.config.dynamic_bs,
                 )
+            _t_rollout = _time.perf_counter() - _t_rollout_start
 
             if self.critic is not None:
                 with (
@@ -430,6 +438,7 @@ class PPOTrainer:
             # Wait for async checkpoint staging to complete before modifying parameters
             self.saver.maybe_wait_for_staging()
 
+            _t_train_start = _time.perf_counter()
             with (
                 stats_tracker.record_timing("train_step"),
                 perf_tracer.trace_scope(
@@ -442,6 +451,7 @@ class PPOTrainer:
                 self.actor.ppo_update(adv_batch)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
+            _t_train = _time.perf_counter() - _t_train_start
 
             if self.critic is not None:
                 with (
@@ -459,6 +469,7 @@ class PPOTrainer:
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
 
+            _t_update_start = _time.perf_counter()
             with (
                 stats_tracker.record_timing("update_weights"),
                 perf_tracer.trace_scope(
@@ -478,6 +489,7 @@ class PPOTrainer:
                 self.rollout.set_version(new_version)
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
+            _t_update = _time.perf_counter() - _t_update_start
 
             with (
                 stats_tracker.record_timing("save"),
@@ -529,6 +541,38 @@ class PPOTrainer:
                 # calling `clear_batches` once should be sufficient.
                 self.actor.clear_batches(rollout_batch, adv_batch)
 
+            # Compute and log throughput/MFU metrics
+            if self._perf_metrics is not None:
+                _perf_stats = self.actor.export_stats()
+                _train_tokens = int(_perf_stats.get("ppo_actor/n_tokens__count", 0))
+                _rollout_tokens = (
+                    sum(len(traj.get("input_ids", [0])) for traj in rollout_batch)
+                    if rollout_batch
+                    else 0
+                )
+
+                self._perf_metrics.record("rollout", _rollout_tokens, _t_rollout)
+                self._perf_metrics.record(
+                    "train_step",
+                    _train_tokens,
+                    _t_train,
+                    seqlens=[_train_tokens] if _train_tokens > 0 else [],
+                )
+                self._perf_metrics.record("update_weights", 0, _t_update)
+
+                _perf = self._perf_metrics.compute()
+                for _k, _v in _perf.items():
+                    stats_tracker.scalar(**{_k: _v})
+
+                logger.info(
+                    "[Perf] throughput=%.0f tok/gpu/s | mfu=%.4f | "
+                    "train=%.0f tok/gpu/s | rollout=%.0f tok/gpu/s",
+                    _perf.get("perf/throughput", 0),
+                    _perf.get("perf/mfu", 0),
+                    _perf.get("perf/throughput/train", 0),
+                    _perf.get("perf/throughput/rollout", 0),
+                )
+
             with perf_tracer.trace_scope(
                 "train.log_stats",
                 category=Category.INSTR,
@@ -575,6 +619,26 @@ class PPOTrainer:
             self.eval_rollout.config_perf_tracer(
                 self.config.perf_tracer, role="eval-rollout"
             )
+
+    def _init_perf_metrics(self) -> PerfMetrics | None:
+        """Create PerfMetrics with FlopsCounter, or None on failure."""
+        try:
+            flops_counter = FlopsCounter(
+                config=self.config.actor.path,
+                device_name=None,
+            )
+        except Exception as e:
+            logger.warning("FlopsCounter init failed: %s; MFU will be 0", e)
+            flops_counter = None
+
+        n_gpus = self.config.cluster.n_nodes * self.config.cluster.n_gpus_per_node
+        # Assume half GPUs for training, half for rollout (1T+1R layout)
+        n_train_gpus = max(n_gpus // 2, 1)
+        return PerfMetrics(
+            flops_counter=flops_counter,
+            n_gpus=n_gpus,
+            n_train_gpus=n_train_gpus,
+        )
 
     def _save_perf_tracer(self, step: int):
         self.actor.save_perf_tracer(step=step)
