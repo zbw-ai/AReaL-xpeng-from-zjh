@@ -1,0 +1,224 @@
+# Qwen3 8B Math RLVR — Throughput benchmark aligned with v070
+#
+# Purpose: Fair throughput comparison with verl v070 fully_async
+# Reference: recipe/rlvr/run_qwen3_8b_32k_async_v070.sh
+#
+# Aligned parameters (from v070):
+#   - max_response_length: 31744 (32K)
+#   - rollout context: 32768
+#   - train_batch_size: 32
+#   - n_samples: 8
+#   - temperature: 0.99, top_p: 0.99, top_k: 100
+#   - lr: 1e-6, weight_decay: 0.1, kl: 0.001
+#   - TP=2, 1T(8GPU) + 1R(8GPU)
+#   - gpu_memory_utilization: 0.85
+#   - epochs: 1
+#   - data: deepmath_math_rule_20k
+#   - eval: aime_2024
+#
+# Kept different (intentionally):
+#   - model: Instruct (default) vs v070's SFT-4450
+#   - eval freq: 20 steps (our setting) vs v070's 100
+#   - PP=2 vs v070's CP=2 (framework difference)
+#   - async: max_head_offpolicyness=2 vs v070's fully_async
+#
+# GPU layout (16 GPUs, same as v070):
+#   Actor  (8 GPU, node 0): megatron:d2t2p2 = DP2 × TP2 × PP2
+#   SGLang (8 GPU, node 1): sglang:d4p1t2  = DP4 × TP2
+#   Ref: colocated with actor
+#
+# Usage:
+#   bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_8b_rlvr_bench_v070.yaml
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-8b-${oc.env:MODEL_TAG,instruct}-rlvr-bench
+trial_name: trial0
+
+seed: 42
+enable_offload: false
+total_train_epochs: 1
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 2
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+# ── Rollout (Inference) — SGLang DP4 × TP2 = 8 GPU (node 1) ──
+rollout:
+  backend: "sglang:d4p1t2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  max_concurrent_rollouts: 64
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config — aligned with v070 ──
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 31744          # ← v070 aligned (was 8192)
+  greedy: false
+  temperature: 0.99
+  top_p: 0.99
+  top_k: 100
+
+# ── Actor (Training) — Megatron DP2 × TP2 × PP2 = 8 GPU (node 0) ──
+actor:
+  backend: "megatron:d2t2p2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3-8B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  mb_spec:
+    max_tokens_per_mb: 16384
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.1
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  megatron:
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — Megatron colocated with actor ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    max_tokens_per_mb: 16384
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── SGLang ──
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 32768            # ← v070 aligned (was 16384)
+  mem_fraction_static: 0.85
+  disable_custom_all_reduce: true
+
+# ── Datasets — deepmath_math_rule_20k (aligned with v070) ──
+train_dataset:
+  batch_size: 32                   # ← v070 aligned (was 16)
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  type: deepmath
+
+valid_dataset:
+  batch_size: 16
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
+  type: aime_2024
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 100
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: []
+  session_tracer:
+    enabled: true
+    flush_threshold: 256
