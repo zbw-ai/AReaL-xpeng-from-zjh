@@ -5,10 +5,10 @@ Dataset format (Parquet):
     - reward_model (dict): {"ground_truth": "1", "style": "rule"}
     - extra_info (dict): {"answer": "1", "difficulty": 10, ...}
 
-Key adaptation:
-    The original prompt ends with "Answer: $Answer (without quotes)".
-    This loader replaces it with "put your final answer within \\boxed{}"
-    to align with the math_verify extractor used in reward computation.
+Key adaptations:
+    1. Prompt: removes ALL "Answer: $Answer" instructions, replaces with \\boxed{}
+    2. Answer: wraps non-numeric answers in \\boxed{} so math_verify can parse them
+       (math_verify cannot parse bare "Yes", "No", "\\infty" etc.)
 
 Returns HuggingFace Dataset with columns: messages, answer
 """
@@ -21,12 +21,6 @@ from datasets import load_dataset
 from areal.utils import logging
 
 logger = logging.getLogger("DeepMathDataset")
-
-# Original suffix in deepmath prompts
-_ORIGINAL_SUFFIX = (
-    "The last line of your response should be of the form "
-    "Answer: $Answer (without quotes) where $Answer is the answer to the problem."
-)
 
 # Replacement suffix aligned with \boxed{} extractor
 _BOXED_SUFFIX = (
@@ -64,10 +58,10 @@ def get_deepmath_rl_dataset(
                 user_content = msg["content"]
                 break
 
-        # Replace "Answer: $Answer" suffix with \boxed{} instruction
-        user_content = _replace_answer_suffix(user_content)
+        # Clean prompt: remove ALL "Answer:" instructions, replace with \boxed{}
+        user_content = _clean_prompt(user_content)
 
-        # Extract ground truth answer
+        # Extract ground truth answer and wrap for math_verify compatibility
         answer = _extract_answer(sample)
 
         messages = [{"role": "user", "content": user_content}]
@@ -98,38 +92,64 @@ def get_deepmath_rl_dataset(
     return dataset
 
 
-def _replace_answer_suffix(text: str) -> str:
-    """Replace 'Answer: $Answer ...' suffix with \\boxed{} instruction."""
-    # Try exact match first
-    if _ORIGINAL_SUFFIX in text:
-        return text.replace(_ORIGINAL_SUFFIX, _BOXED_SUFFIX)
+def _clean_prompt(text: str) -> str:
+    """Remove ALL 'Answer:' related instructions and replace with \\boxed{}.
 
-    # Fallback: regex for variations of "Answer: $Answer" pattern
-    pattern = r"The last line.*?Answer:\s*\$Answer.*?(?:problem|question)\.?"
-    replaced = re.sub(pattern, _BOXED_SUFFIX, text, flags=re.DOTALL)
-    if replaced != text:
-        return replaced
-
-    # If no match, append \boxed{} instruction
-    if "\\boxed{}" not in text:
-        text = text.rstrip() + "\n" + _BOXED_SUFFIX
+    Handles multiple variations:
+      - "The last line of your response should be of the form Answer: $Answer ..."
+      - "Remember to put your answer on its own line after 'Answer:'."
+      - "Solve the following math problem step by step."
+    """
+    # Remove "The last line ... Answer: $Answer ... problem."
+    text = re.sub(
+        r"The last line.*?Answer:\s*\$Answer.*?(?:problem|question)\.?\s*",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    # Remove "Remember to put your answer on its own line after 'Answer:'."
+    text = re.sub(
+        r"Remember to put your answer on its own line after ['\"]?Answer:['\"]?\.?\s*",
+        "",
+        text,
+    )
+    # Remove standalone "Solve the following math problem step by step." if we're adding our own
+    text = re.sub(
+        r"^Solve the following math problem step by step\.\s*",
+        "",
+        text,
+    )
+    # Clean up extra whitespace / newlines
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    # Append \boxed{} instruction
+    text = text + "\n\n" + _BOXED_SUFFIX
     return text
 
 
 def _extract_answer(sample: dict) -> str:
-    """Extract ground truth answer from reward_model or extra_info."""
+    """Extract ground truth answer and wrap in \\boxed{} for math_verify.
+
+    math_verify's gold extraction requires answers to be parseable.
+    Bare strings like "Yes", "No", "\\infty" cause ValueError.
+    Wrapping in \\boxed{} lets the LaTeX extractor handle them.
+    """
+    raw = ""
     # Primary: reward_model.ground_truth
     rm = sample.get("reward_model", {})
     if isinstance(rm, dict) and rm.get("ground_truth"):
-        return str(rm["ground_truth"])
-
+        raw = str(rm["ground_truth"])
     # Fallback: extra_info.answer
-    ei = sample.get("extra_info", {})
-    if isinstance(ei, dict) and ei.get("answer"):
-        return str(ei["answer"])
+    if not raw:
+        ei = sample.get("extra_info", {})
+        if isinstance(ei, dict) and ei.get("answer"):
+            raw = str(ei["answer"])
 
-    logger.warning(f"No answer found for sample: {sample.get('data_source', '?')}")
-    return ""
+    if not raw:
+        logger.warning(f"No answer found for sample: {sample.get('data_source', '?')}")
+        return ""
+
+    # Wrap in \boxed{} so math_verify can parse it as LaTeX
+    return "\\boxed{" + raw + "}"
 
 
 def _load_dataset(path: str, split: str):
