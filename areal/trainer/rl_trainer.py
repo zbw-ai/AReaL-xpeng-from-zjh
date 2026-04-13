@@ -545,9 +545,12 @@ class PPOTrainer:
             if self._perf_metrics is not None:
                 _perf_stats = self.actor.export_stats()
                 _train_tokens = int(_perf_stats.get("ppo_actor/n_tokens__count", 0))
-                # RTensor objects don't support len(); use train_tokens as proxy
-                # (rollout and train process the same batch of sequences)
-                _rollout_tokens = _train_tokens
+                # Rollout tokens = full sequences (prompt + response).
+                # n_tokens only counts loss-masked tokens (response).
+                # Use seq_len/avg * n_seqs for total rollout tokens.
+                _n_seqs = int(_perf_stats.get("ppo_actor/n_seqs__count", 0))
+                _avg_seq_len = _perf_stats.get("ppo_actor/seq_len/avg", 0)
+                _rollout_tokens = int(_n_seqs * _avg_seq_len)
 
                 self._perf_metrics.record("rollout", _rollout_tokens, _t_rollout)
                 self._perf_metrics.record(
