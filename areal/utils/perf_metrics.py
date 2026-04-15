@@ -86,26 +86,36 @@ class PerfMetrics:
     def compute(self) -> dict[str, float]:
         """Compute all metrics for the current step, reset accumulators, and return.
 
+        Throughput calculation aligns with verl v070 ``compute_throughout_metrics``:
+        ``total_sequence_tokens / step_time / n_gpus``, where
+        ``total_sequence_tokens`` is the full-sequence token count from the
+        rollout phase (prompt + response), NOT the sum of rollout + train tokens.
+
         Returns:
             A dict with the following keys:
 
-            * ``perf/throughput``         — total_tokens / total_time / n_gpus
+            * ``perf/throughput``         — sequence_tokens / step_time / n_gpus
+              (aligned with verl v070: ``global_token_num / step / n_gpus``)
             * ``perf/throughput/train``   — train_tokens / train_time / n_gpus
             * ``perf/throughput/rollout`` — rollout_tokens / rollout_time / n_gpus
             * ``perf/mfu``                — estimated_tflops / promised_tflops / n_train_gpus
             * ``perf/time_per_step``      — sum of all phase elapsed times
-            * ``perf/total_tokens``       — sum of all phase token counts
+            * ``perf/total_tokens``       — full-sequence token count (from rollout)
         """
         phases = self._phases
         self._phases = {}  # reset immediately so any re-entrant call is clean
 
-        # Aggregate totals
-        total_tokens = sum(d.n_tokens for d in phases.values())
+        # Step time = sum of all phase times
         total_time = sum(d.elapsed_sec for d in phases.values())
 
         # Per-category aggregates
         train_data = phases.get("train_step", _PhaseData())
         rollout_data = phases.get("rollout", _PhaseData())
+
+        # Total tokens = full-sequence tokens from rollout (prompt + response),
+        # aligned with verl v070's global_token_num.
+        # NOT rollout_tokens + train_tokens (they measure different things).
+        total_tokens = rollout_data.n_tokens
 
         def _safe_throughput(tokens: int, time: float) -> float:
             if time <= 0 or self._n_gpus <= 0:
@@ -127,11 +137,15 @@ class PerfMetrics:
                 if promised_tflops > 0:
                     mfu = estimated_tflops / promised_tflops / self._n_train_gpus
             except Exception:
-                logger.warning("Failed to estimate FLOPs; MFU will be 0.", exc_info=True)
+                logger.warning(
+                    "Failed to estimate FLOPs; MFU will be 0.", exc_info=True
+                )
 
         return {
             "perf/throughput": _safe_throughput(total_tokens, total_time),
-            "perf/throughput/train": _safe_throughput(train_data.n_tokens, train_data.elapsed_sec),
+            "perf/throughput/train": _safe_throughput(
+                train_data.n_tokens, train_data.elapsed_sec
+            ),
             "perf/throughput/rollout": _safe_throughput(
                 rollout_data.n_tokens, rollout_data.elapsed_sec
             ),

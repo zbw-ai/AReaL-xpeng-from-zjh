@@ -6,7 +6,6 @@ import pytest
 
 from areal.utils.perf_metrics import PerfMetrics
 
-
 # ---------------------------------------------------------------------------
 # Shared fixtures
 # ---------------------------------------------------------------------------
@@ -33,11 +32,13 @@ def test_train_throughput(mock_counter):
 
 
 def test_overall_throughput(mock_counter):
+    """perf/throughput uses rollout tokens (full sequence) / step time, aligned with verl v070."""
     pm = PerfMetrics(mock_counter, n_gpus=16, n_train_gpus=8)
     pm.record("rollout", n_tokens=8000, elapsed_sec=2.0)
-    pm.record("train_step", n_tokens=8000, elapsed_sec=1.0)
+    pm.record("train_step", n_tokens=5000, elapsed_sec=1.0)  # different from rollout
     result = pm.compute()
-    assert result["perf/throughput"] == pytest.approx(16000 / 3.0 / 16)
+    # throughput = rollout_tokens / total_time / n_gpus (NOT rollout + train)
+    assert result["perf/throughput"] == pytest.approx(8000 / 3.0 / 16)
 
 
 def test_rollout_throughput(mock_counter):
@@ -122,9 +123,9 @@ def test_time_per_step(mock_counter):
 
 
 def test_total_tokens(mock_counter):
-    """perf/total_tokens is the sum of all phase token counts."""
+    """perf/total_tokens is the full-sequence token count from rollout (aligned with verl v070)."""
     pm = PerfMetrics(mock_counter, n_gpus=16, n_train_gpus=8)
     pm.record("rollout", n_tokens=6000, elapsed_sec=1.0)
     pm.record("train_step", n_tokens=4000, elapsed_sec=1.0)
     result = pm.compute()
-    assert result["perf/total_tokens"] == pytest.approx(10000.0)
+    assert result["perf/total_tokens"] == pytest.approx(6000.0)  # rollout only, not 6000+4000
