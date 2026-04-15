@@ -15,7 +15,7 @@ trial_name: trial0
 
 seed: 42
 enable_offload: false
-total_train_epochs: 10
+total_train_epochs: 2  # 快速验证，看 reward 趋势
 tokenizer_path: ${actor.path}
 
 cluster:
@@ -147,8 +147,8 @@ valid_dataset:
   batch_size: 16
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
-  type: dapo_math
+  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
+  type: aime_2024
 
 # ── Utilities ──
 saver:
@@ -156,7 +156,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 10000
+  freq_steps: 100
   freq_secs: null
 
 recover:
@@ -192,9 +192,9 @@ perf_tracer:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  enabled: true
+  enabled: false
   save_interval: 1
-  profile_steps: [10]
+  profile_steps: []
   session_tracer:
     enabled: true
     flush_threshold: 256
