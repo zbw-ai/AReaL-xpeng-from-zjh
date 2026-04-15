@@ -341,6 +341,7 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
+            _t_step_start = _time.perf_counter()  # whole step timer (aligned with verl v070)
             _t_rollout_start = _time.perf_counter()
             with (
                 stats_tracker.record_timing("rollout"),
@@ -541,46 +542,26 @@ class PPOTrainer:
                 # calling `clear_batches` once should be sufficient.
                 self.actor.clear_batches(rollout_batch, adv_batch)
 
-            # Compute and log throughput/MFU metrics
-            if self._perf_metrics is not None:
-                _perf_stats = self.actor.export_stats()
-                _train_tokens = int(_perf_stats.get("ppo_actor/n_tokens__count", 0))
-                # Rollout tokens = full sequences (prompt + response).
-                # n_tokens only counts loss-masked tokens (response).
-                # Use seq_len/avg * n_seqs for total rollout tokens.
-                _n_seqs = int(_perf_stats.get("ppo_actor/n_seqs__count", 0))
-                _avg_seq_len = _perf_stats.get("ppo_actor/seq_len/avg", 0)
-                _rollout_tokens = int(_n_seqs * _avg_seq_len)
-
-                self._perf_metrics.record("rollout", _rollout_tokens, _t_rollout)
-                self._perf_metrics.record(
-                    "train_step",
-                    _train_tokens,
-                    _t_train,
-                    seqlens=[_train_tokens] if _train_tokens > 0 else [],
-                )
-                self._perf_metrics.record("update_weights", 0, _t_update)
-
-                _perf = self._perf_metrics.compute()
-                for _k, _v in _perf.items():
-                    stats_tracker.scalar(**{_k: _v})
-
-                logger.info(
-                    "[Perf] throughput=%.0f tok/gpu/s | mfu=%.4f | "
-                    "train=%.0f tok/gpu/s | rollout=%.0f tok/gpu/s",
-                    _perf.get("perf/throughput", 0),
-                    _perf.get("perf/mfu", 0),
-                    _perf.get("perf/throughput/train", 0),
-                    _perf.get("perf/throughput/rollout", 0),
-                )
-
             with perf_tracer.trace_scope(
                 "train.log_stats",
                 category=Category.INSTR,
                 args={"global_step": global_step},
             ):
+                _t_step = _time.perf_counter() - _t_step_start  # whole step
                 self._export_and_commit_stats(
-                    epoch=epoch, epoch_step=step, global_step=global_step
+                    epoch=epoch,
+                    epoch_step=step,
+                    global_step=global_step,
+                    perf_timings=(
+                        {
+                            "step": _t_step,
+                            "rollout": _t_rollout,
+                            "train_step": _t_train,
+                            "update_weights": _t_update,
+                        }
+                        if self._perf_metrics is not None
+                        else None
+                    ),
                 )
 
             # Resume rollout
@@ -957,12 +938,61 @@ class PPOTrainer:
         dist.barrier(group=self.actor.cpu_group)
         current_platform.synchronize()
 
-    def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+    def _export_and_commit_stats(
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        perf_timings: dict[str, float] | None = None,
+    ):
         # Upload statistics to the logger (e.g., wandb)
         stats = self.actor.export_stats()
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
+
+        # Compute throughput/MFU from the same stats dict (before commit)
+        if perf_timings is not None and self._perf_metrics is not None:
+            _train_tokens = int(stats.get("ppo_actor/n_tokens", 0))
+            _n_seqs = int(stats.get("ppo_actor/n_seqs", 0))
+            _avg_seq_len = stats.get("ppo_actor/seq_len/avg", 0)
+            _rollout_tokens = int(_n_seqs * _avg_seq_len)
+
+            # Use whole-step time for overall throughput (aligned with verl v070),
+            # not sum of individual phases (which misses recompute_logp, advantage, etc.)
+            _t_step = perf_timings["step"]
+
+            self._perf_metrics.record(
+                "rollout", _rollout_tokens, perf_timings["rollout"]
+            )
+            self._perf_metrics.record(
+                "train_step",
+                _train_tokens,
+                perf_timings["train_step"],
+                seqlens=([int(_avg_seq_len)] * _n_seqs if _n_seqs > 0 else []),
+            )
+            self._perf_metrics.record(
+                "update_weights", 0, perf_timings["update_weights"]
+            )
+
+            _perf = self._perf_metrics.compute()
+            # Override time_per_step and throughput with whole-step measurement
+            _perf["perf/time_per_step"] = _t_step
+            if _t_step > 0 and self._perf_metrics._n_gpus > 0:
+                _perf["perf/throughput"] = _rollout_tokens / _t_step / self._perf_metrics._n_gpus
+
+            stats.update(_perf)
+            logger.info(
+                "[Perf] throughput=%.0f tok/gpu/s | mfu=%.4f | "
+                "train=%.0f tok/gpu/s | rollout=%.0f tok/gpu/s | "
+                "step_time=%.1fs",
+                _perf.get("perf/throughput", 0),
+                _perf.get("perf/mfu", 0),
+                _perf.get("perf/throughput/train", 0),
+                _perf.get("perf/throughput/rollout", 0),
+                _perf.get("perf/time_per_step", 0),
+            )
+
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
         dist.barrier(group=self.actor.cpu_group)
