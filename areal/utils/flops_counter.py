@@ -89,9 +89,11 @@ def _estimate_qwen2_flops(
     intermediate_size: int = config.intermediate_size
     num_hidden_layers: int = config.num_hidden_layers
     num_attention_heads: int = config.num_attention_heads
-    num_key_value_heads: int = getattr(config, "num_key_value_heads", num_attention_heads)
+    num_key_value_heads: int = getattr(
+        config, "num_key_value_heads", num_attention_heads
+    )
     vocab_size: int = config.vocab_size
-    head_dim: int = hidden_size // num_attention_heads
+    head_dim: int = getattr(config, "head_dim", hidden_size // num_attention_heads)
 
     q_size = num_attention_heads * head_dim
     k_size = num_key_value_heads * head_dim
@@ -99,7 +101,9 @@ def _estimate_qwen2_flops(
 
     # Parameter counts (weight matrices only; biases ignored per convention)
     mlp_n = hidden_size * intermediate_size * 3  # SwiGLU: gate, up, down
-    attn_linear_n = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    attn_linear_n = hidden_size * (
+        q_size + k_size + v_size + num_attention_heads * head_dim
+    )
     emb_and_lm_head_n = vocab_size * hidden_size * 2
 
     dense_n = (mlp_n + attn_linear_n) * num_hidden_layers + emb_and_lm_head_n
@@ -144,9 +148,11 @@ def _estimate_qwen2_moe_flops(
     )
     num_hidden_layers: int = config.num_hidden_layers
     num_attention_heads: int = config.num_attention_heads
-    num_key_value_heads: int = getattr(config, "num_key_value_heads", num_attention_heads)
+    num_key_value_heads: int = getattr(
+        config, "num_key_value_heads", num_attention_heads
+    )
     vocab_size: int = config.vocab_size
-    head_dim: int = hidden_size // num_attention_heads
+    head_dim: int = getattr(config, "head_dim", hidden_size // num_attention_heads)
     num_experts_per_tok: int = getattr(config, "num_experts_per_tok", 1)
 
     q_size = num_attention_heads * head_dim
@@ -155,7 +161,9 @@ def _estimate_qwen2_moe_flops(
 
     # Only count activated experts (num_experts_per_tok) for MLP FLOPs
     mlp_n = hidden_size * moe_intermediate_size * 3 * num_experts_per_tok
-    attn_linear_n = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    attn_linear_n = hidden_size * (
+        q_size + k_size + v_size + num_attention_heads * head_dim
+    )
     emb_and_lm_head_n = vocab_size * hidden_size * 2
 
     dense_n = (mlp_n + attn_linear_n) * num_hidden_layers + emb_and_lm_head_n
@@ -197,7 +205,8 @@ def _estimate_unknown_flops(
 
     # Rough estimate: 12 * hidden² * layers + 2 * vocab * hidden (embeddings)
     estimated_total_params = (
-        12 * hidden_size * hidden_size * num_hidden_layers + 2 * vocab_size * hidden_size
+        12 * hidden_size * hidden_size * num_hidden_layers
+        + 2 * vocab_size * hidden_size
     )
 
     total_flops = 6 * estimated_total_params * tokens_sum

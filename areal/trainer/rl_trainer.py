@@ -615,7 +615,13 @@ class PPOTrainer:
 
         n_gpus = self.config.cluster.n_nodes * self.config.cluster.n_gpus_per_node
         # Assume half GPUs for training, half for rollout (1T+1R layout)
+        # TODO: parse actor backend string for precise count
         n_train_gpus = max(n_gpus // 2, 1)
+        logger.info(
+            "PerfMetrics: n_gpus=%d, n_train_gpus=%d (assumed 1T+1R layout)",
+            n_gpus,
+            n_train_gpus,
+        )
         return PerfMetrics(
             flops_counter=flops_counter,
             n_gpus=n_gpus,
@@ -958,6 +964,14 @@ class PPOTrainer:
             _avg_seq_len = stats.get("ppo_actor/seq_len/avg", 0)
             _rollout_tokens = int(_n_seqs * _avg_seq_len)
 
+            if _n_seqs == 0 or _avg_seq_len == 0:
+                logger.warning(
+                    "Missing token stats for perf metrics: "
+                    "n_seqs=%d, avg_seq_len=%s, train_tokens=%d. "
+                    "Throughput will be 0 for this step.",
+                    _n_seqs, _avg_seq_len, _train_tokens,
+                )
+
             # Use whole-step time for overall throughput (aligned with verl v070),
             # not sum of individual phases (which misses recompute_logp, advantage, etc.)
             _t_step = perf_timings["step"]
@@ -975,11 +989,7 @@ class PPOTrainer:
                 "update_weights", 0, perf_timings["update_weights"]
             )
 
-            _perf = self._perf_metrics.compute()
-            # Override time_per_step and throughput with whole-step measurement
-            _perf["perf/time_per_step"] = _t_step
-            if _t_step > 0 and self._perf_metrics._n_gpus > 0:
-                _perf["perf/throughput"] = _rollout_tokens / _t_step / self._perf_metrics._n_gpus
+            _perf = self._perf_metrics.compute(step_time=_t_step)
 
             stats.update(_perf)
             logger.info(

@@ -83,13 +83,25 @@ class PerfMetrics:
         if seqlens:
             data.seqlens.extend(seqlens)
 
-    def compute(self) -> dict[str, float]:
+    @property
+    def n_gpus(self) -> int:
+        """Total GPU count across all nodes."""
+        return self._n_gpus
+
+    def compute(self, step_time: float | None = None) -> dict[str, float]:
         """Compute all metrics for the current step, reset accumulators, and return.
 
         Throughput calculation aligns with verl v070 ``compute_throughout_metrics``:
         ``total_sequence_tokens / step_time / n_gpus``, where
         ``total_sequence_tokens`` is the full-sequence token count from the
         rollout phase (prompt + response), NOT the sum of rollout + train tokens.
+
+        Args:
+            step_time: Whole-step wall-clock time in seconds (from
+                ``time.perf_counter()`` wrapping the entire step).  When
+                provided, used for ``perf/throughput`` and ``perf/time_per_step``
+                instead of the sum of recorded phase times.  This aligns with
+                verl v070's ``timing_raw["step"]``.
 
         Returns:
             A dict with the following keys:
@@ -99,14 +111,15 @@ class PerfMetrics:
             * ``perf/throughput/train``   — train_tokens / train_time / n_gpus
             * ``perf/throughput/rollout`` — rollout_tokens / rollout_time / n_gpus
             * ``perf/mfu``                — estimated_tflops / promised_tflops / n_train_gpus
-            * ``perf/time_per_step``      — sum of all phase elapsed times
+            * ``perf/time_per_step``      — whole-step time (or sum of phases if step_time not given)
             * ``perf/total_tokens``       — full-sequence token count (from rollout)
         """
         phases = self._phases
         self._phases = {}  # reset immediately so any re-entrant call is clean
 
-        # Step time = sum of all phase times
-        total_time = sum(d.elapsed_sec for d in phases.values())
+        # Step time: prefer whole-step measurement, fallback to sum of phases
+        phases_time = sum(d.elapsed_sec for d in phases.values())
+        total_time = step_time if step_time is not None else phases_time
 
         # Per-category aggregates
         train_data = phases.get("train_step", _PhaseData())
