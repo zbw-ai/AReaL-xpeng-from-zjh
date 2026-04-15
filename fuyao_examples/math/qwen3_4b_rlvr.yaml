@@ -1,16 +1,27 @@
-# Qwen3 4B Math RLVR — dapo_math_17k
-# Strictly aligned with ROLL fuyao_examples/rlvr config
-#   - Training: Megatron (TP1/PP1), distributed optimizer
-#   - Inference: SGLang
-#   - Algorithm: REINFORCE (adv_estimator mapped via reward_norm)
-#   - Data: dapo_math_17k_processed
+# Qwen3 4B Math RLVR — Aligned with POLARIS recipe
+#
+# Reference: POLARIS (HKU NLP + ByteDance Seed)
+#   - Model: Qwen3-4B (post-trained)
+#   - Algorithm: DAPO+GRPO+ fusion (no KL, no entropy loss, Clip-Higher)
+#   - Data: dapo_math_17k (TODO: filter by pass-rate after first run)
+#   - Temperature: 1.4 (POLARIS Stage-1)
+#   - n_samples: 8
+#   - Cluster: 1 node × 8 GPU (A100 80G)
+#
+# Purpose: Validate AReaL RL framework can produce reward improvement
+#          on a model+data combination in the ideal difficulty range.
+#
+# GPU layout (8 GPUs):
+#   Actor  (4 GPU): megatron:d4t1p1 = DP4 × TP1 × PP1
+#   SGLang (4 GPU): sglang:d4p1t1  = DP4 × TP1
+#   Ref: colocated with actor
 #
 # Usage:
 #   bash fuyao_examples/fuyao_areal_run.sh \
 #       --run-type math_rlvr \
 #       --config fuyao_examples/math/qwen3_4b_rlvr.yaml
 
-experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-math-rlvr
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-polaris-rlvr
 trial_name: trial0
 
 seed: 42
@@ -44,22 +55,22 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
 
-# ── Generation Config — aligned with ROLL ──
+# ── Generation Config — aligned with POLARIS Stage-1 ──
 gconfig:
-  n_samples: 4
+  n_samples: 8                   # POLARIS: 8 (was 4)
   min_new_tokens: 0
   max_new_tokens: 8192
   greedy: false
-  temperature: 0.99
-  top_p: 0.99
-  top_k: 100
+  temperature: 1.4               # POLARIS Stage-1: 1.4 (was 0.99)
+  top_p: 1.0                     # POLARIS: 1.0 (was 0.99)
+  top_k: 20                      # POLARIS: 20 (was 100)
 
-# ── Actor (Training) — Megatron TP1/PP1, aligned with ROLL ──
+# ── Actor (Training) — Megatron TP1/PP1 ──
 actor:
   backend: "megatron:d4t1p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /publicdata/huggingface.co/Qwen/Qwen3-4B  # ← model path
+  path: /publicdata/huggingface.co/Qwen/Qwen3-4B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
@@ -69,7 +80,7 @@ actor:
   optimizer:
     type: adam
     lr: 1.0e-6
-    weight_decay: 0
+    weight_decay: 0.1             # POLARIS style (was 0)
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
@@ -77,14 +88,17 @@ actor:
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.01
   eps_clip: 0.2
+  eps_clip_higher: 0.28           # POLARIS: Clip-Higher (新增)
   temperature: ${gconfig.temperature}
-  reward_scaling: 10.0
-  reward_bias: -0.5
-  kl_ctl: 0.0
+  reward_scaling: 1.0             # 不缩放 (was 10.0)
+  reward_bias: 0.0                # 不偏置 (was -0.5)
+  kl_ctl: 0.0                    # POLARIS: 无 KL
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  behave_imp_weight_cap: 5.0
+  mask_no_eos_with_zero: true     # DAPO: 截断序列排除出 loss (新增)
+  behave_imp_weight_cap: 2.0      # (was 5.0)
+  behave_imp_weight_mode: token_mask
   adv_norm:
     mean_level: batch
     std_level: batch
@@ -134,13 +148,13 @@ sglang:
   context_length: 16384
   mem_fraction_static: 0.7
 
-# ── Datasets — dapo_math_17k ──
+# ── Datasets ──
 train_dataset:
   batch_size: 16
   shuffle: true
   pin_memory: true
   num_workers: 4
-  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed  # ← data path
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
   type: dapo_math
 
 valid_dataset:
