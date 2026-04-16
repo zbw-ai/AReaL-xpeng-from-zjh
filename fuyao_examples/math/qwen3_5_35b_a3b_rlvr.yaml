@@ -4,7 +4,7 @@
 #   - Algorithm: GRPO
 #   - Data: dapo_math_17k_processed
 #   - Cluster: 4 nodes × 8 GPU = 32 GPU (A100 80G)
-#   - Sequence: 32K max response
+#   - Sequence: 8K max response
 #
 # GPU layout (32 GPUs total):
 #   Actor  (16 GPU): archon:d16 = FSDP across 16 GPU
@@ -61,7 +61,7 @@ rollout:
 gconfig:
   n_samples: 8
   min_new_tokens: 0
-  max_new_tokens: 16384
+  max_new_tokens: 8192
   greedy: false
   temperature: 0.9
   top_p: 1.0
@@ -83,7 +83,7 @@ actor:
   mb_spec:
     n_mbs: 4
     granularity: 1
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 10240
     n_mbs_divisor: 1
   pad_to_maximum: false
   optimizer:
@@ -98,10 +98,8 @@ actor:
     warmup_steps_proportion: 0.01
   archon:
     offload_params: false
-    activation_checkpoint:
-      mode: full
+    ac_mode: full
     enable_compile: true
-    reshard_after_forward_policy: default
   eps_clip: 0.2
   temperature: ${gconfig.temperature}
   reward_scaling: 1.0
@@ -141,15 +139,13 @@ ref:
   mb_spec:
     n_mbs: 4
     granularity: 1
-    max_tokens_per_mb: 32768
+    max_tokens_per_mb: 10240
     n_mbs_divisor: 1
   optimizer: null
   archon:
     offload_params: false
-    activation_checkpoint:
-      mode: full
+    ac_mode: full
     enable_compile: true
-    reshard_after_forward_policy: default
   scheduling_strategy:
     type: colocation
     target: actor
@@ -162,8 +158,8 @@ sglang:
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
   max_running_requests: null
-  context_length: 32768
-  mem_fraction_static: 0.82
+  context_length: 10240
+  mem_fraction_static: 0.8
   disable_custom_all_reduce: true
 
 # ── Datasets — dapo_math_17k ──
