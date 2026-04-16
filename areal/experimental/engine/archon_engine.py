@@ -137,6 +137,26 @@ class ArchonTrainContext:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
 
 
+def freeze_moe_router(model: torch.nn.Module) -> int:
+    """Freeze MoE router weights to stabilize expert routing during RL training.
+
+    Finds all parameters matching ``*.moe.router.*`` and sets
+    ``requires_grad = False``.
+
+    Args:
+        model: The model whose MoE routers should be frozen.
+
+    Returns:
+        Number of router parameters frozen.
+    """
+    count = 0
+    for name, param in model.named_parameters():
+        if ".moe.router." in name:
+            param.requires_grad_(False)
+            count += 1
+    return count
+
+
 class ArchonEngine(TrainEngine):
     """Archon Engine is a torch-native training backend."""
 
@@ -319,6 +339,15 @@ class ArchonEngine(TrainEngine):
         )
 
         self._materialize_and_load_weights()
+
+        # Freeze MoE router weights for RL training stability
+        for model_part in self.model_parts:
+            n_frozen = freeze_moe_router(model_part)
+            if n_frozen > 0:
+                self.logger.info(
+                    f"Froze {n_frozen} MoE router parameter(s) for RL stability"
+                )
+
         self._create_optimizer(ft_spec)
 
         self.runner = create_runner(

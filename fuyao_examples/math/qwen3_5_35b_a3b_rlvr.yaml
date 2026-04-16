@@ -1,36 +1,34 @@
-# Qwen3 4B Math RLVR — Aligned with POLARIS recipe
+# Qwen3.5-35B-A3B (MoE + GDN) Math RLVR — dapo_math_17k
+#   - Training: Archon FSDP-only (Phase 1 MVP, no TP/EP)
+#   - Inference: SGLang (TP4, DP4)
+#   - Algorithm: GRPO
+#   - Data: dapo_math_17k_processed
+#   - Cluster: 4 nodes × 8 GPU = 32 GPU (A100 80G)
+#   - Sequence: 32K max response
 #
-# Reference: POLARIS (HKU NLP + ByteDance Seed)
-#   - Model: Qwen3-4B (post-trained)
-#   - Algorithm: DAPO+GRPO+ fusion (no KL, no entropy loss, Clip-Higher)
-#   - Data: dapo_math_17k (TODO: filter by pass-rate after first run)
-#   - Temperature: 1.4 (POLARIS Stage-1)
-#   - n_samples: 8
-#   - Cluster: 1 node × 8 GPU (A100 80G)
-#
-# Purpose: Validate AReaL RL framework can produce reward improvement
-#          on a model+data combination in the ideal difficulty range.
-#
-# GPU layout (8 GPUs):
-#   Actor  (4 GPU): megatron:d4t1p1 = DP4 × TP1 × PP1
-#   SGLang (4 GPU): sglang:d4p1t1  = DP4 × TP1
+# GPU layout (32 GPUs total):
+#   Actor  (16 GPU): archon:d16 = FSDP across 16 GPU
+#   SGLang (16 GPU): sglang:d4t4 = DP4 × TP4 = 16 GPU
 #   Ref: colocated with actor
+#
+# Phase 1 NOTE: FSDP-only has high all-gather overhead for MoE layers.
+# Phase 2 will add EP+TP for production throughput.
 #
 # Usage:
 #   bash fuyao_examples/fuyao_areal_run.sh \
 #       --run-type math_rlvr \
-#       --config fuyao_examples/math/qwen3_4b_rlvr.yaml
+#       --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr.yaml
 
-experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-4b-polaris-rlvr
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-math-rlvr
 trial_name: trial0
 
 seed: 42
 enable_offload: false
-total_train_epochs: 2  # 快速验证，看 reward 趋势
+total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 2
+  n_nodes: 4
   n_gpus_per_node: 8
   fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
   name_resolve:
@@ -40,11 +38,15 @@ cluster:
 scheduler:
   type: local
 
-# ── Rollout (Inference) — SGLang ──
+# ── Rollout (Inference) — SGLang TP4 × DP4 = 16 GPU ──
+# TP=4 matches num_kv_heads=4 (1 head per GPU, optimal split)
+# Qwen3.5 GDN layers use recurrent state (no KV cache), so only 9/36
+# full attention layers need KV — inference is very memory-efficient.
 rollout:
-  backend: "sglang:d2p1t4"            # DP2×TP4, fewer instances for 32K context
+  backend: "sglang:d4t4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
+  setup_timeout: 600.0
   max_concurrent_rollouts: 64
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
@@ -55,49 +57,60 @@ rollout:
   tokenizer_path: ${tokenizer_path}
   dump_to_file: true
 
-# ── Generation Config — aligned with POLARIS Stage-1 ──
+# ── Generation Config ──
 gconfig:
-  n_samples: 8                   # POLARIS: 8 (was 4)
+  n_samples: 8
   min_new_tokens: 0
-  max_new_tokens: 31744              # 32K response, enabled by CP2
+  max_new_tokens: 16384
   greedy: false
-  temperature: 1.4               # POLARIS Stage-1: 1.4 (was 0.99)
-  top_p: 1.0                     # POLARIS: 1.0 (was 0.99)
-  top_k: -1                       # POLARIS: disabled
+  temperature: 0.9
+  top_p: 1.0
+  top_k: -1
 
-# ── Actor (Training) — Megatron TP1/PP1 ──
+# ── Actor (Training) — Archon FSDP-only: 16 GPU ──
+# Phase 1: Pure FSDP across 16 GPUs. All 35.5B params are sharded.
+# Each GPU holds 1/16 of model state (~55 GB peak, fits in 80 GB).
 actor:
-  backend: "megatron:d2t2c2p1"       # DP2×TP2×CP2, aligned with v070
+  backend: "archon:d16"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  path: /publicdata/huggingface.co/Qwen/Qwen3-4B
+  path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
   init_from_scratch: false
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
+  grad_reduce_dtype: float32
   mb_spec:
-    max_tokens_per_mb: 16384
+    n_mbs: 4
+    granularity: 1
+    max_tokens_per_mb: 32768
+    n_mbs_divisor: 1
+  pad_to_maximum: false
   optimizer:
     type: adam
     lr: 1.0e-6
-    weight_decay: 0.1             # POLARIS style (was 0)
+    weight_decay: 0.01
     beta1: 0.9
     beta2: 0.999
     eps: 1e-8
     lr_scheduler_type: cosine
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.01
+  archon:
+    offload_params: false
+    activation_checkpoint:
+      mode: full
+    enable_compile: true
+    reshard_after_forward_policy: default
   eps_clip: 0.2
-  eps_clip_higher: 0.28           # POLARIS: Clip-Higher (新增)
   temperature: ${gconfig.temperature}
-  reward_scaling: 1.0             # 不缩放 (was 10.0)
-  reward_bias: 0.0                # 不偏置 (was -0.5)
-  kl_ctl: 0.001                   # POLARIS actual value
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
-  mask_no_eos_with_zero: true     # DAPO: 截断序列排除出 loss (新增)
-  behave_imp_weight_cap: 2.0      # (was 5.0)
+  behave_imp_weight_cap: 2.0
   behave_imp_weight_mode: token_mask
   adv_norm:
     mean_level: batch
@@ -106,11 +119,6 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  megatron:
-    use_deterministic_algorithms: true
-    recompute_granularity: full
-    recompute_method: uniform
-    recompute_num_layers: 1
   weight_update_mode: xccl
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
@@ -121,7 +129,7 @@ actor:
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars: {}
 
-# ── Reference Model — Megatron colocated with actor ──
+# ── Reference Model — Archon colocated with actor ──
 ref:
   backend: ${actor.backend}
   experiment_name: ${experiment_name}
@@ -131,8 +139,17 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    max_tokens_per_mb: 16384
+    n_mbs: 4
+    granularity: 1
+    max_tokens_per_mb: 32768
+    n_mbs_divisor: 1
   optimizer: null
+  archon:
+    offload_params: false
+    activation_checkpoint:
+      mode: full
+    enable_compile: true
+    reshard_after_forward_policy: default
   scheduling_strategy:
     type: colocation
     target: actor
@@ -145,13 +162,13 @@ sglang:
   skip_tokenizer_init: false
   dtype: ${actor.dtype}
   max_running_requests: null
-  context_length: 32768              # 32K context, CP2 reduces per-GPU KV cache
-  mem_fraction_static: 0.85
-  disable_custom_all_reduce: true    # Required for TP2
+  context_length: 32768
+  mem_fraction_static: 0.82
+  disable_custom_all_reduce: true
 
-# ── Datasets ──
+# ── Datasets — dapo_math_17k ──
 train_dataset:
-  batch_size: 16
+  batch_size: 8
   shuffle: true
   pin_memory: true
   num_workers: 4
@@ -159,11 +176,11 @@ train_dataset:
   type: dapo_math
 
 valid_dataset:
-  batch_size: 16
+  batch_size: 8
   pin_memory: true
   num_workers: 4
-  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
-  type: aime_2024
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
 
 # ── Utilities ──
 saver:
@@ -171,7 +188,7 @@ saver:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: 1
-  freq_steps: 100
+  freq_steps: 10000
   freq_secs: null
 
 recover:
@@ -208,8 +225,5 @@ perf_tracer:
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   enabled: false
-  save_interval: 1
-  profile_steps: []
   session_tracer:
-    enabled: true
-    flush_threshold: 256
+    enabled: false
