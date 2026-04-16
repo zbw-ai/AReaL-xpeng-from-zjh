@@ -42,7 +42,7 @@ scheduler:
 
 # ── Rollout (Inference) — SGLang ──
 rollout:
-  backend: "sglang:d4p1t2"
+  backend: "sglang:d8p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 64
@@ -67,7 +67,7 @@ gconfig:
 
 # ── Actor (Training) — Megatron TP1/PP1 ──
 actor:
-  backend: "megatron:d4t2p1"
+  backend: "megatron:d8t1p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /publicdata/huggingface.co/Qwen/Qwen3-4B
