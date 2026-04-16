@@ -30,7 +30,7 @@ total_train_epochs: 2  # 快速验证，看 reward 趋势
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 1
+  n_nodes: 2
   n_gpus_per_node: 8
   fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
   name_resolve:
@@ -42,7 +42,7 @@ scheduler:
 
 # ── Rollout (Inference) — SGLang ──
 rollout:
-  backend: "sglang:d4p1t1"
+  backend: "sglang:d4p1t2"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 64
@@ -59,15 +59,15 @@ rollout:
 gconfig:
   n_samples: 8                   # POLARIS: 8 (was 4)
   min_new_tokens: 0
-  max_new_tokens: 8192
+  max_new_tokens: 15360              # context 16K - prompt ~1K
   greedy: false
   temperature: 1.4               # POLARIS Stage-1: 1.4 (was 0.99)
   top_p: 1.0                     # POLARIS: 1.0 (was 0.99)
-  top_k: 20                      # POLARIS: 20 (was 100)
+  top_k: -1                       # POLARIS: disabled
 
 # ── Actor (Training) — Megatron TP1/PP1 ──
 actor:
-  backend: "megatron:d4t1p1"
+  backend: "megatron:d4t2p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /publicdata/huggingface.co/Qwen/Qwen3-4B
@@ -92,7 +92,7 @@ actor:
   temperature: ${gconfig.temperature}
   reward_scaling: 1.0             # 不缩放 (was 10.0)
   reward_bias: 0.0                # 不偏置 (was -0.5)
-  kl_ctl: 0.0                    # POLARIS: 无 KL
+  kl_ctl: 0.001                   # POLARIS actual value
   ppo_n_minibatches: 1
   recompute_logprob: true
   use_decoupled_loss: true
@@ -146,7 +146,8 @@ sglang:
   dtype: ${actor.dtype}
   max_running_requests: null
   context_length: 16384
-  mem_fraction_static: 0.7
+  mem_fraction_static: 0.85
+  disable_custom_all_reduce: true    # Required for TP2
 
 # ── Datasets ──
 train_dataset:
