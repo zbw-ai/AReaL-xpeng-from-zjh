@@ -30,7 +30,7 @@ total_train_epochs: 2  # 快速验证，看 reward 趋势
 tokenizer_path: ${actor.path}
 
 cluster:
-  n_nodes: 2
+  n_nodes: 1
   n_gpus_per_node: 8
   fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
   name_resolve:
@@ -42,7 +42,7 @@ scheduler:
 
 # ── Rollout (Inference) — SGLang ──
 rollout:
-  backend: "sglang:d8p1t1"
+  backend: "sglang:d4p1t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   max_concurrent_rollouts: 64
@@ -67,7 +67,7 @@ gconfig:
 
 # ── Actor (Training) — Megatron TP1/PP1 ──
 actor:
-  backend: "megatron:d8t1p1"
+  backend: "megatron:d4t1p1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /publicdata/huggingface.co/Qwen/Qwen3-4B
@@ -146,7 +146,7 @@ sglang:
   dtype: ${actor.dtype}
   max_running_requests: null
   context_length: 16384
-  mem_fraction_static: 0.85
+  mem_fraction_static: 0.7
   disable_custom_all_reduce: true    # Required for TP2
 
 # ── Datasets ──
