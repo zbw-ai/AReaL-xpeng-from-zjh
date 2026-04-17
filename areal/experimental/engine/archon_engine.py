@@ -169,7 +169,8 @@ class ArchonEngine(TrainEngine):
         # Model Configuration (loaded during __init__)
         # AutoConfig requires model_type in CONFIG_MAPPING. For new models
         # (e.g. qwen3_5_moe) not yet in the installed transformers version,
-        # load config.json directly and build a PretrainedConfig from it.
+        # load config.json directly as a nested SimpleNamespace so all
+        # fields (including nested text_config) are attribute-accessible.
         try:
             self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path=self.config.path,
@@ -178,11 +179,18 @@ class ArchonEngine(TrainEngine):
         except (ValueError, KeyError):
             import json
             from pathlib import Path
+            from types import SimpleNamespace
+
+            def _dict_to_ns(d):
+                if isinstance(d, dict):
+                    return SimpleNamespace(**{k: _dict_to_ns(v) for k, v in d.items()})
+                if isinstance(d, list):
+                    return [_dict_to_ns(x) for x in d]
+                return d
 
             config_path = Path(self.config.path) / "config.json"
             with open(config_path) as f:
-                config_dict = json.load(f)
-            self.model_config = PretrainedConfig(**config_dict)
+                self.model_config = _dict_to_ns(json.load(f))
         self._validate_model_type()
 
         self.spec: ModelSpec = get_model_spec(
