@@ -104,14 +104,6 @@ else
     pip install flash-linear-attention 2>&1 | tail -3
     echo "[qwen3.5-deps] Done."
 fi
-# transformers 需要支持 qwen3_5_moe 架构（4.57.1 不支持）
-if python -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
-    echo "[qwen3.5-deps] transformers supports qwen3_5_moe, skip."
-else
-    echo "[qwen3.5-deps] Upgrading transformers for Qwen3.5 support..."
-    pip install --upgrade transformers 2>&1 | tail -3
-    echo "[qwen3.5-deps] Done."
-fi
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
