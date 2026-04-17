@@ -67,19 +67,20 @@ def _merge_qkv_weights(
     )
     if num_attention_heads is None:
         raise AttributeError("HF config missing num_attention_heads")
-    num_key_value_heads = _get_hf_config_attr(
-        hf_config,
-        ("num_key_value_heads", "num_kv_heads", "n_kv_heads"),
-        default=num_attention_heads,
-    )
     hidden_dim = _get_hf_config_attr(hf_config, ("hidden_size",), default=None)
     if hidden_dim is None:
         raise AttributeError("HF config missing hidden_size")
-    head_dim = getattr(hf_config, "head_dim", hidden_dim // num_attention_heads)
-    group_dim = head_dim * num_attention_heads // num_key_value_heads
     q, k, v = hf_weights_safe_slice
+    q_dim = _get_shape(q)[0]
+    k_dim = _get_shape(k)[0]
+    # Derive head_dim from Q tensor shape — robust for VLMs where config.head_dim
+    # may be missing and hidden_size // num_attention_heads gives the wrong value
+    # (e.g. Qwen3.5: hidden=2048, heads=64 → fallback=32, but actual head_dim=128).
+    head_dim = q_dim // num_attention_heads
+    num_key_value_heads = k_dim // head_dim if head_dim > 0 else num_attention_heads
+    group_dim = head_dim * num_attention_heads // num_key_value_heads
     # q k v might be tp split
-    real_num_key_value_heads = _get_shape(q)[0] // group_dim
+    real_num_key_value_heads = q_dim // group_dim
     s = _get_tp_slice((real_num_key_value_heads * group_dim,), 0, tp_rank, tp_size)
     q = q[s].reshape(
         real_num_key_value_heads // tp_size,
@@ -112,7 +113,11 @@ def _load_fused_qkv_weight(
     x = hf_weights_safe_slice[0]
     x = x[:] if not isinstance(x, torch.Tensor) else x
 
-    num_heads = hf_config.num_attention_heads
+    num_heads = _get_hf_config_attr(
+        hf_config, ("num_attention_heads",), default=None
+    )
+    if num_heads is None:
+        raise AttributeError("HF config missing num_attention_heads")
     num_kv_heads = _get_hf_config_attr(
         hf_config,
         ("num_key_value_heads", "num_kv_heads", "n_kv_heads"),
