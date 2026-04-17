@@ -260,7 +260,7 @@ if $USE_RAY; then
 
         # 等待所有节点加入
         echo "[ray] Waiting for all ${NUM_NODES} nodes to join..."
-        MAX_WAIT=300
+        MAX_WAIT=600
         ELAPSED=0
         while true; do
             JOINED=$(python3 -c "
