@@ -167,29 +167,10 @@ class ArchonEngine(TrainEngine):
         self.enable_tree_training = config.enable_tree_training
 
         # Model Configuration (loaded during __init__)
-        # AutoConfig requires model_type in CONFIG_MAPPING. For new models
-        # (e.g. qwen3_5_moe) not yet in the installed transformers version,
-        # load config.json directly as a nested SimpleNamespace so all
-        # fields (including nested text_config) are attribute-accessible.
-        try:
-            self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
-                pretrained_model_name_or_path=self.config.path,
-                trust_remote_code=True,
-            )
-        except (ValueError, KeyError):
-            import json
-            from pathlib import Path
-            from types import SimpleNamespace
-
-            config_path = Path(self.config.path) / "config.json"
-            with open(config_path) as f:
-                config_dict = json.load(f)
-            # Top-level fields as attributes; nested dicts stay as dicts
-            # (code uses .get() on nested dicts like rope_parameters).
-            # text_config also needs attribute access (from_hf_config extracts it).
-            if "text_config" in config_dict and isinstance(config_dict["text_config"], dict):
-                config_dict["text_config"] = SimpleNamespace(**config_dict["text_config"])
-            self.model_config = SimpleNamespace(**config_dict)
+        self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path=self.config.path,
+            trust_remote_code=True,
+        )
         self._validate_model_type()
 
         self.spec: ModelSpec = get_model_spec(
