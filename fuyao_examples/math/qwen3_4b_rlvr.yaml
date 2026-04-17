@@ -1,19 +1,11 @@
-# Qwen3 4B Math RLVR — Aligned with POLARIS recipe
+# Qwen3 4B Math RLVR — POLARIS-aligned, 2 nodes, 32K response, CP2
 #
 # Reference: POLARIS (HKU NLP + ByteDance Seed)
-#   - Model: Qwen3-4B (post-trained)
-#   - Algorithm: DAPO+GRPO+ fusion (no KL, no entropy loss, Clip-Higher)
-#   - Data: dapo_math_17k (TODO: filter by pass-rate after first run)
-#   - Temperature: 1.4 (POLARIS Stage-1)
-#   - n_samples: 8
-#   - Cluster: 1 node × 8 GPU (A100 80G)
+#   Stage 1: max_response=39936, temp=1.4, kl=0.001, clip 0.2-0.28
 #
-# Purpose: Validate AReaL RL framework can produce reward improvement
-#          on a model+data combination in the ideal difficulty range.
-#
-# GPU layout (8 GPUs):
-#   Actor  (4 GPU): megatron:d4t1p1 = DP4 × TP1 × PP1
-#   SGLang (4 GPU): sglang:d4p1t1  = DP4 × TP1
+# GPU layout (2 nodes × 8 GPU = 16 GPU):
+#   Actor  (8 GPU, node 0): megatron:d2t2c2p1 = DP2 × TP2 × CP2
+#   SGLang (8 GPU, node 1): sglang:d2p1t4     = DP2 × TP4
 #   Ref: colocated with actor
 #
 # Usage:
@@ -65,7 +57,7 @@ gconfig:
   top_p: 1.0                     # POLARIS: 1.0 (was 0.99)
   top_k: -1                       # POLARIS: disabled
 
-# ── Actor (Training) — Megatron TP1/PP1 ──
+# ── Actor (Training) — Megatron DP2 × TP2 × CP2 = 8 GPU (node 0) ──
 actor:
   backend: "megatron:d2t2c2p1"       # DP2×TP2×CP2, aligned with v070
   experiment_name: ${experiment_name}
@@ -170,8 +162,8 @@ saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: 1
-  freq_steps: 100
+  freq_epochs: null                # Disabled: TP merge with colocated ref may OOM
+  freq_steps: null                 # Enable after confirming training works
   freq_secs: null
 
 recover:
