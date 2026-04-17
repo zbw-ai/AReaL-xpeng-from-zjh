@@ -1,0 +1,226 @@
+# Qwen3 30B-A3B (MoE) Math RLVR — dapo_math_17k
+#   - Training: Megatron with Expert Parallelism
+#   - Inference: SGLang (TP4, DP4)
+#   - Algorithm: GRPO (group-relative, kl_ctl=0)
+#   - Data: dapo_math_17k_processed
+#   - Cluster: 4 nodes × 8 GPU = 32 GPU (A100 80G)
+#
+# GPU layout (32 GPUs total):
+#   Actor  (16 GPU): megatron:(attn:d2p2t4|ffn:d1p2e8) = 16 GPU
+#   SGLang (16 GPU): sglang:d4t4 = DP4 × TP4 = 16 GPU
+#   Ref: colocated with actor
+#
+# Usage:
+#   bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_30b_a3b_rlvr.yaml
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3-30b-a3b-math-rlvr
+trial_name: trial0
+
+seed: 42
+enable_offload: false  # TMS offload not supported by RayScheduler, only works with SlurmScheduler/SPMD
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 4
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+# scheduler.type 由启动脚本根据节点数自动注入：
+#   单节点 → local, 多节点 → ray (自动启动 Ray cluster)
+scheduler:
+  type: local
+
+# ── Rollout (Inference) — SGLang TP4 × DP4 = 16 GPU ──
+rollout:
+  backend: "sglang:d4t4"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 600.0
+  max_concurrent_rollouts: 128
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config — aligned with v070 recipe ──
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 8192
+  greedy: false
+  temperature: 0.9
+  top_p: 1.0
+  top_k: -1
+
+# ── Actor (Training) — Megatron MoE: 16 GPU ──
+# PP=2 halves per-GPU model memory (weights + optimizer), no CP all_gather overhead
+# attn: d2 × p2 × t4 = 16 GPU
+# ffn:  dp(auto=1) × e8 × etp1 × p2 = 16 GPU
+actor:
+  backend: "megatron:(attn:d2p2t4|ffn:e8t1)"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/llm_train_sft/lisy23/SFT_Qwen3_A3B_Base/qwen3_a3b_base_ot3_sft_0202_17k_bs16_mbs2_fuse_8e-5_64gpus/global_step_2225/huggingface
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 10240
+    n_mbs_divisor: 1
+  pad_to_maximum: false  # Avoid worst-case padding waste; saves significant memory for variable-length sequences
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001       # aligned with v070: small KL regularization to stabilize training
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0   # aligned with v070: rollout_is_threshold=2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — Megatron colocated with actor ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 10240
+    n_mbs_divisor: 1
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── SGLang ──
+sglang:
+  model_path: ${actor.path}
+  random_seed: ${seed}
+  skip_tokenizer_init: false
+  dtype: ${actor.dtype}
+  max_running_requests: null
+  context_length: 10240
+  mem_fraction_static: 0.8
+  disable_custom_all_reduce: true  # Fix: custom_all_reduce.cuh:350 crash during CUDA graph capture with TP4
+
+# ── Datasets — dapo_math_17k ──
+train_dataset:
+  batch_size: 16
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+valid_dataset:
+  batch_size: 16
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
