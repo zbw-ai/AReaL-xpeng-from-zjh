@@ -67,11 +67,11 @@ gconfig:
   top_p: 1.0
   top_k: -1
 
-# ── Actor (Training) — Archon FSDP-only: 16 GPU ──
-# Phase 1: Pure FSDP across 16 GPUs. All 35.5B params are sharded.
-# Each GPU holds 1/16 of model state (~55 GB peak, fits in 80 GB).
+# ── Actor (Training) — FSDP: 16 GPU ──
+# Uses HF AutoModelForCausalLM — no custom adapter needed.
+# HF handles VLM checkpoint format (model.language_model.* prefix) natively.
 actor:
-  backend: "archon:d16"
+  backend: "fsdp:d16"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
@@ -96,10 +96,6 @@ actor:
     lr_scheduler_type: cosine
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.01
-  archon:
-    offload_params: false
-    ac_mode: full
-    enable_compile: true
   eps_clip: 0.2
   temperature: ${gconfig.temperature}
   reward_scaling: 1.0
@@ -142,10 +138,6 @@ ref:
     max_tokens_per_mb: 10240
     n_mbs_divisor: 1
   optimizer: null
-  archon:
-    offload_params: false
-    ac_mode: full
-    enable_compile: true
   scheduling_strategy:
     type: colocation
     target: actor
