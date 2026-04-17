@@ -96,7 +96,11 @@ fi
 
 # ========================== 3.5 Qwen3.5 运行时依赖 ==========================
 # transformers>=5.3.0 支持 qwen3_5_moe，fla + causal-conv1d 是 GDN 核函数
-# uv pip install 需要 --upgrade 才会升级已安装的包
+# 使用共享 NFS cache 加速多节点安装（第一个节点下载，后续节点秒装）
+_UV_CACHE="/dataset_rc_llmrl/zengbw1/.uv_cache"
+mkdir -p "$_UV_CACHE" 2>/dev/null || true
+export UV_CACHE_DIR="$_UV_CACHE"
+
 if python -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
     echo "[qwen3.5-deps] transformers already supports qwen3_5_moe, skip."
 else
@@ -260,7 +264,7 @@ if $USE_RAY; then
 
         # 等待所有节点加入
         echo "[ray] Waiting for all ${NUM_NODES} nodes to join..."
-        MAX_WAIT=600
+        MAX_WAIT=900
         ELAPSED=0
         while true; do
             JOINED=$(python3 -c "
