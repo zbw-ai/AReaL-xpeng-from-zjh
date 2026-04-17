@@ -94,9 +94,16 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     exit 1
 fi
 
-# ========================== 3.5 Qwen3.5 GDN 运行时依赖 ==========================
-# causal-conv1d 是 CUDA 扩展，fla 包含 Triton 核函数，transformers 需要
-# 支持 qwen3_5_moe model_type 的版本。在 GPU 节点上按需安装。
+# ========================== 3.5 Qwen3.5 运行时依赖 ==========================
+# 1) transformers>=5.3.0 才支持 qwen3_5_moe model_type（veRL 同样升级）
+# 2) fla + causal-conv1d 是 GDN 核函数依赖
+if python -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
+    echo "[qwen3.5-deps] transformers already supports qwen3_5_moe, skip."
+else
+    echo "[qwen3.5-deps] Upgrading transformers + tokenizers for Qwen3.5..."
+    pip install --upgrade --no-cache-dir transformers tokenizers 2>&1 | tail -3
+    echo "[qwen3.5-deps] Done."
+fi
 if python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
     echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
 else
