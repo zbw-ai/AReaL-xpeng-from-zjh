@@ -42,6 +42,7 @@ rollout:
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 2
   enable_rollout_tracing: false
+  setup_timeout: 600
   scheduling_spec: ${actor.scheduling_spec}
   fileroot: ${cluster.fileroot}
   tokenizer_path: ${tokenizer_path}
@@ -162,13 +163,13 @@ saver:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
-  freq_epochs: null                # Disabled: TP merge with colocated ref may OOM
-  freq_steps: null                 # Enable after confirming training works
+  freq_epochs: 1                # Disabled: TP merge with colocated ref may OOM
+  freq_steps: 100                # Enable after confirming training works
   freq_secs: null
 
 recover:
   mode: disabled
-  experiment_name: ${experiment_name}
+  experiment_name: ${experiment_name}2
   trial_name: ${trial_name}
   fileroot: ${cluster.fileroot}
   freq_epochs: null

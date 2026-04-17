@@ -24,6 +24,19 @@ from areal.utils import logging
 logger = logging.getLogger("HFLoader")
 
 
+def _get_hf_config_attr(hf_config, names: tuple[str, ...], default=None):
+    """Read config attr from hf_config or nested text_config (for VLM-style configs)."""
+    for name in names:
+        if hasattr(hf_config, name):
+            return getattr(hf_config, name)
+    text_cfg = getattr(hf_config, "text_config", None)
+    if text_cfg is not None:
+        for name in names:
+            if hasattr(text_cfg, name):
+                return getattr(text_cfg, name)
+    return default
+
+
 def _get_tp_slice(shape, dim, tp_rank, tp_size) -> tuple:
     size_per_tp = shape[dim] // tp_size
     res = [slice(None) for _ in range(dim)]
@@ -49,9 +62,19 @@ def _merge_qkv_weights(
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
     """Merge Q, K, V weights into a single QKV weight tensor."""
     assert len(hf_weights_safe_slice) == 3
-    num_key_value_heads = hf_config.num_key_value_heads
-    hidden_dim = hf_config.hidden_size
-    num_attention_heads = hf_config.num_attention_heads
+    num_attention_heads = _get_hf_config_attr(
+        hf_config, ("num_attention_heads",), default=None
+    )
+    if num_attention_heads is None:
+        raise AttributeError("HF config missing num_attention_heads")
+    num_key_value_heads = _get_hf_config_attr(
+        hf_config,
+        ("num_key_value_heads", "num_kv_heads", "n_kv_heads"),
+        default=num_attention_heads,
+    )
+    hidden_dim = _get_hf_config_attr(hf_config, ("hidden_size",), default=None)
+    if hidden_dim is None:
+        raise AttributeError("HF config missing hidden_size")
     head_dim = getattr(hf_config, "head_dim", hidden_dim // num_attention_heads)
     group_dim = head_dim * num_attention_heads // num_key_value_heads
     q, k, v = hf_weights_safe_slice
@@ -90,7 +113,11 @@ def _load_fused_qkv_weight(
     x = x[:] if not isinstance(x, torch.Tensor) else x
 
     num_heads = hf_config.num_attention_heads
-    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_heads)
+    num_kv_heads = _get_hf_config_attr(
+        hf_config,
+        ("num_key_value_heads", "num_kv_heads", "n_kv_heads"),
+        default=num_heads,
+    )
     head_dim = x.shape[0] // (num_heads + 2 * num_kv_heads)
     hidden = x.shape[1]
 
@@ -154,10 +181,80 @@ def _slice_generic_weight(
     hf_weights_safe_slice: list,
     tp_rank: int,
     tp_size: int,
+    mcore_weights_name: str | None = None,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
     """Slice generic weight tensor based on shape mismatch."""
-    assert len(hf_weights_safe_slice) == 1
-    x = hf_weights_safe_slice[0]
+    if len(hf_weights_safe_slice) == 1:
+        x = hf_weights_safe_slice[0]
+    else:
+        hf_shapes = [_get_shape(w) for w in hf_weights_safe_slice]
+        ndim = len(hf_shapes[0])
+        concat_candidates: list[tuple[int, list[int]]] = []
+        for dim in range(ndim):
+            if not all(len(s) == ndim for s in hf_shapes):
+                continue
+            if all(
+                all((i == dim) or (s[i] == hf_shapes[0][i]) for i in range(ndim))
+                for s in hf_shapes[1:]
+            ):
+                merged_shape = list(hf_shapes[0])
+                merged_shape[dim] = sum(s[dim] for s in hf_shapes)
+                concat_candidates.append((dim, merged_shape))
+
+        selected: tuple[int, list[int]] | None = None
+
+        # Prefer a concat dim that directly matches local mcore parameter shape.
+        for dim, merged_shape in concat_candidates:
+            if merged_shape == mcore_param_shape:
+                selected = (dim, merged_shape)
+                break
+
+        # Otherwise, prefer a concat dim that matches a TP-sharded global shape.
+        if selected is None:
+            for dim, merged_shape in concat_candidates:
+                mismatch_dims = [
+                    i
+                    for i, (s1, s2) in enumerate(zip(merged_shape, mcore_param_shape))
+                    if s1 != s2
+                ]
+                if len(mismatch_dims) != 1:
+                    continue
+                mismatch_dim = mismatch_dims[0]
+                if merged_shape[mismatch_dim] == mcore_param_shape[mismatch_dim] * tp_size:
+                    selected = (dim, merged_shape)
+                    break
+
+        # Fallback for unambiguous multi-slice cases.
+        if selected is None and len(concat_candidates) == 1:
+            selected = concat_candidates[0]
+
+        if selected is None:
+            raise ValueError(
+                "Cannot infer how to merge generic HF weights for mcore parameter "
+                f"{mcore_weights_name or '<unknown>'}. "
+                f"HF slice count={len(hf_weights_safe_slice)}, "
+                f"HF shapes={hf_shapes}, target local shape={mcore_param_shape}, "
+                f"tp_size={tp_size}."
+            )
+
+        concat_dim, merged_shape = selected
+        logger.warning(
+            "Merging %d HF slices for generic parameter %s by concatenating dim %d: "
+            "HF shapes=%s -> merged=%s, local shape=%s, tp_size=%d.",
+            len(hf_weights_safe_slice),
+            mcore_weights_name or "<unknown>",
+            concat_dim,
+            hf_shapes,
+            merged_shape,
+            mcore_param_shape,
+            tp_size,
+        )
+        # Materialize safetensor slices before torch.cat. FP8 helper is a Tensor subclass.
+        tensors = [
+            w if isinstance(w, torch.Tensor) else w[:] for w in hf_weights_safe_slice
+        ]
+        x = torch.cat(tensors, dim=concat_dim)
+
     x_shape = _get_shape(x)
     partition_dim = None
     if mcore_param_shape == x_shape:
@@ -214,7 +311,11 @@ def _weight_to_mcore_tp(
         res = _slice_moe_expert_weight(hf_weights_safe_slice, tp_rank, tp_size)
     else:
         res = _slice_generic_weight(
-            mcore_param_shape, hf_weights_safe_slice, tp_rank, tp_size
+            mcore_param_shape,
+            hf_weights_safe_slice,
+            tp_rank,
+            tp_size,
+            mcore_weights_name=mcore_weights_name,
         )
 
     if dtype is not None and not isinstance(res, FP8BlockwiseTensorHelper):

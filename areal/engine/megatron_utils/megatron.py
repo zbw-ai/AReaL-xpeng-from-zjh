@@ -753,9 +753,39 @@ def convert_bailingmoe_to_hf(
     raise ValueError(f"Unknown parameter name: {name}")
 
 
+def convert_qwen3_5_to_hf(
+    tf_config: TransformerConfig,
+    name: str,
+    param: Parameter | Tensor | FP8BlockwiseTensorHelper,
+):
+    """Convert Qwen3.5 megatron params to HF format.
+
+    Qwen3.5 support in mbridge has had multiple internal implementations.
+    We first try hybrid-attention mapping (Bailing-style), then fallback to
+    Qwen3-MoE mapping for compatible parameter layouts.
+    """
+    converters = (convert_bailingmoe_to_hf, convert_qwen3moe_to_hf)
+    last_error: Exception | None = None
+    for fn in converters:
+        try:
+            return fn(tf_config, name, param)
+        except ValueError as e:
+            last_error = e
+            continue
+
+    raise ValueError(
+        f"Unknown parameter name for qwen3_5 conversion: {name}. "
+        f"Last converter error: {last_error}"
+    )
+
+
 # Adapted from slime
 # A registry for conversion functions is more extensible.
 _CONVERSION_FN_REGISTRY = {
+    "qwen3_5_moe_text": convert_qwen3_5_to_hf,
+    "qwen3_5_moe": convert_qwen3_5_to_hf,
+    "qwen3_5_text": convert_qwen3_5_to_hf,
+    "qwen3_5": convert_qwen3_5_to_hf,
     "qwen3_moe": convert_qwen3moe_to_hf,
     "qwen2": convert_qwen2_to_hf,
     "qwen3": convert_qwen2_to_hf,
@@ -764,6 +794,19 @@ _CONVERSION_FN_REGISTRY = {
     "bailing_moe_linear": convert_bailingmoe_to_hf,
     "bailing_hybrid": convert_bailingmoe_to_hf,
 }
+
+
+def _resolve_conversion_fn(model_name: str):
+    # Prefer exact match first.
+    if model_name in _CONVERSION_FN_REGISTRY:
+        return _CONVERSION_FN_REGISTRY[model_name]
+
+    # Then fallback to substring matching with longest-key priority.
+    # This avoids "qwen3" capturing "qwen3_5_*".
+    for key in sorted(_CONVERSION_FN_REGISTRY, key=len, reverse=True):
+        if key in model_name:
+            return _CONVERSION_FN_REGISTRY[key]
+    return None
 
 
 def convert_to_hf(
@@ -793,18 +836,16 @@ def convert_to_hf(
         List of (name, tensor) tuples in HuggingFace format. For FP8 quantization,
         returns both quantized weight and scale tensors.
     """
-    for key, conversion_fn in _CONVERSION_FN_REGISTRY.items():
-        if key in model_name:
-            converted_named_tensors = conversion_fn(tf_config, name, param)
-            if quantization_config:
-                if fp8_direct_convert:
-                    return convert_fp8_helper_to_pytorch_fp8(converted_named_tensors)
-                else:
-                    # Quantize from bf16 to PyTorch FP8
-                    return quantize_params(
-                        name, converted_named_tensors, quantization_config
-                    )
-            return converted_named_tensors
+    conversion_fn = _resolve_conversion_fn(model_name)
+    if conversion_fn is not None:
+        converted_named_tensors = conversion_fn(tf_config, name, param)
+        if quantization_config:
+            if fp8_direct_convert:
+                return convert_fp8_helper_to_pytorch_fp8(converted_named_tensors)
+            else:
+                # Quantize from bf16 to PyTorch FP8
+                return quantize_params(name, converted_named_tensors, quantization_config)
+        return converted_named_tensors
 
     raise ValueError(f"Unsupported model for HF conversion: {model_name}")
 

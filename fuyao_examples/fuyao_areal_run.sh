@@ -101,7 +101,7 @@ if python -c "from transformers.models.auto.configuration_auto import CONFIG_MAP
     :  # OK
 else
     echo "[qwen3.5-deps] WARNING: transformers does not support qwen3_5_moe."
-    echo "[qwen3.5-deps] Use docker image areal-qwen3_5-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
+    echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
 # ========================== 4. 清理残留进程 ==========================

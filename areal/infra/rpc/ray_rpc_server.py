@@ -35,6 +35,8 @@ class RayRPCServer:
         self._engines: dict[str, TrainEngine | InferenceEngine] = {}
         self._default_engine_name: str | None = None  # For backward compatibility
         self._allocated_port = set()
+        self._seed_base: int | None = None
+        self._seed_key: str | None = None
         self.logger = logging.getLogger("RayRPCServer")
 
     def _get_device(self):
@@ -53,10 +55,12 @@ class RayRPCServer:
 
     def configure(self, config: BaseExperimentConfig, role: str, rank: int) -> None:
         name_resolve.reconfigure(config.cluster.name_resolve)
-        # Set seed for any TrainEngine instances
+        self._seed_base = config.seed
+        self._seed_key = f"{role}{rank}"
+        # Set seed for any TrainEngine instances that already exist.
         for engine in self._engines.values():
             if isinstance(engine, TrainEngine):
-                seeding.set_random_seed(config.seed, key=f"{role}{rank}")
+                seeding.set_random_seed(self._seed_base, key=self._seed_key)
                 break
         self.logger.info(f"RayRPCServer configured for role role={role}, rank={rank}")
 
@@ -88,6 +92,26 @@ class RayRPCServer:
             # Track first engine as default for backward compatibility
             if self._default_engine_name is None:
                 self._default_engine_name = engine_name
+
+            # Scheduler configures workers before engine creation, so seed here as well.
+            if (
+                isinstance(engine, TrainEngine)
+            ):
+                # configure.remote() is fire-and-forget in RayScheduler; derive seed from
+                # init kwargs when configure hasn't completed yet.
+                if self._seed_base is None:
+                    cfg = init_kwargs.get("config", None)
+                    if cfg is not None and hasattr(cfg, "seed"):
+                        self._seed_base = int(getattr(cfg, "seed"))
+                if self._seed_key is None and engine_name is not None:
+                    try:
+                        role, rank = engine_name.split("/", 1)
+                        self._seed_key = f"{role}{rank}"
+                    except ValueError:
+                        # Fallback when engine_name doesn't follow role/index.
+                        self._seed_key = engine_name.replace("/", "")
+                if self._seed_base is not None and self._seed_key is not None:
+                    seeding.set_random_seed(self._seed_base, key=self._seed_key)
 
             self.logger.info(
                 f"RayRPCServer Engine '{engine}' instantiated as '{engine_name}'!"
