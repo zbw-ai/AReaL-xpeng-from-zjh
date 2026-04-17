@@ -121,6 +121,14 @@ def make_hf_and_mcore_config(
             "BailingHybridForCausalLM",
         ):
             return hf_config, hf_to_mcore_config_bailing_moe(hf_config, dtype)
+        elif architecture in (
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+        ):
+            raise ValueError(
+                f"Architecture '{architecture}' requires mbridge with Qwen3.5 support. "
+                f"Install: pip install -U git+https://github.com/ISEEKYAN/mbridge.git"
+            )
         else:
             raise ValueError(
                 f"Architecture not registered for config conversion: {architecture}."
@@ -138,6 +146,14 @@ def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerCo
         "BailingHybridForCausalLM",
     ):
         return make_mcore_layer_specs_bailing_moe(tf_config, hf_config, use_te=True)
+    elif architecture in (
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    ):
+        raise ValueError(
+            f"Architecture '{architecture}' requires mbridge with Qwen3.5 support. "
+            f"Install: pip install -U git+https://github.com/ISEEKYAN/mbridge.git"
+        )
     else:
         raise ValueError(
             f"Architecture not registered for config conversion: {architecture}."

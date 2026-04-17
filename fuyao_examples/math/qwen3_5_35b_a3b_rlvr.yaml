@@ -1,5 +1,5 @@
 # Qwen3.5-35B-A3B (MoE + GDN) Math RLVR — dapo_math_17k
-#   - Training: Archon FSDP-only (Phase 1 MVP, no TP/EP)
+#   - Training: Megatron with Expert Parallelism (mbridge)
 #   - Inference: SGLang (TP4, DP4)
 #   - Algorithm: GRPO
 #   - Data: dapo_math_17k_processed
@@ -7,12 +7,12 @@
 #   - Sequence: 8K max response
 #
 # GPU layout (32 GPUs total):
-#   Actor  (16 GPU): archon:d16 = FSDP across 16 GPU
+#   Actor  (16 GPU): megatron:(attn:d2p2t4|ffn:e8t1) = 16 GPU
 #   SGLang (16 GPU): sglang:d4t4 = DP4 × TP4 = 16 GPU
 #   Ref: colocated with actor
 #
-# Phase 1 NOTE: FSDP-only has high all-gather overhead for MoE layers.
-# Phase 2 will add EP+TP for production throughput.
+# NOTE: Qwen3.5 GDN linear attention requires bshd format:
+#   pad_to_maximum=true (no THD/remove_padding support yet)
 #
 # Usage:
 #   bash fuyao_examples/fuyao_areal_run.sh \
@@ -39,9 +39,6 @@ scheduler:
   type: local
 
 # ── Rollout (Inference) — SGLang TP4 × DP4 = 16 GPU ──
-# TP=4 matches num_kv_heads=4 (1 head per GPU, optimal split)
-# Qwen3.5 GDN layers use recurrent state (no KV cache), so only 9/36
-# full attention layers need KV — inference is very memory-efficient.
 rollout:
   backend: "sglang:d4t4"
   experiment_name: ${experiment_name}
@@ -67,11 +64,11 @@ gconfig:
   top_p: 1.0
   top_k: -1
 
-# ── Actor (Training) — FSDP: 16 GPU ──
-# Uses HF AutoModelForCausalLM — no custom adapter needed.
-# HF handles VLM checkpoint format (model.language_model.* prefix) natively.
+# ── Actor (Training) — Megatron MoE: 16 GPU ──
+# attn: d2 × p2 × t4 = 16 GPU
+# ffn:  dp(auto) × e8 × etp1 × p2 = 16 GPU
 actor:
-  backend: "fsdp:d16"
+  backend: "megatron:(attn:d2p2t4|ffn:e8t1)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
@@ -81,11 +78,11 @@ actor:
   dtype: bfloat16
   grad_reduce_dtype: float32
   mb_spec:
-    n_mbs: 4
+    n_mbs: 1
     granularity: 1
     max_tokens_per_mb: 10240
     n_mbs_divisor: 1
-  pad_to_maximum: false
+  pad_to_maximum: true   # REQUIRED: Qwen3.5 GDN requires bshd format (no THD support)
   optimizer:
     type: adam
     lr: 1.0e-6
@@ -96,6 +93,19 @@ actor:
     lr_scheduler_type: cosine
     gradient_clipping: 1.0
     warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
   eps_clip: 0.2
   temperature: ${gconfig.temperature}
   reward_scaling: 1.0
@@ -123,7 +133,7 @@ actor:
       cmd: python3 -m areal.infra.rpc.rpc_server
       env_vars: {}
 
-# ── Reference Model — Archon colocated with actor ──
+# ── Reference Model — Megatron colocated with actor ──
 ref:
   backend: ${actor.backend}
   experiment_name: ${experiment_name}
@@ -133,7 +143,7 @@ ref:
   disable_dropout: true
   dtype: ${actor.dtype}
   mb_spec:
-    n_mbs: 4
+    n_mbs: 1
     granularity: 1
     max_tokens_per_mb: 10240
     n_mbs_divisor: 1
