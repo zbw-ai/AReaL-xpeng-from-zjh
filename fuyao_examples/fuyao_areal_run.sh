@@ -96,17 +96,13 @@ fi
 
 # ========================== 3.5 Qwen3.5 GDN 运行时依赖 ==========================
 # fla + causal-conv1d 是 GDN 核函数依赖（训练侧需要）
-# transformers 升级不再需要 — archon_engine.py 已有 fallback 直接读 config.json
-VENV_PIP="/AReaL/.venv/bin/pip"
-VENV_PYTHON="/AReaL/.venv/bin/python"
-if [[ -x "$VENV_PIP" ]]; then
-    if $VENV_PYTHON -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
-        echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
-    else
-        echo "[qwen3.5-deps] Installing flash-linear-attention + causal-conv1d in venv..."
-        $VENV_PIP install flash-linear-attention 2>&1 | tail -3
-        echo "[qwen3.5-deps] Done."
-    fi
+# uv 管理的 venv 没有 pip，必须用 uv pip install
+if python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
+    echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
+else
+    echo "[qwen3.5-deps] Installing flash-linear-attention + causal-conv1d..."
+    uv pip install flash-linear-attention 2>&1 | tail -5
+    echo "[qwen3.5-deps] Done."
 fi
 
 # ========================== 4. 清理残留进程 ==========================
