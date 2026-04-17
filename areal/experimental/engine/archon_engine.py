@@ -181,16 +181,15 @@ class ArchonEngine(TrainEngine):
             from pathlib import Path
             from types import SimpleNamespace
 
-            def _dict_to_ns(d):
-                if isinstance(d, dict):
-                    return SimpleNamespace(**{k: _dict_to_ns(v) for k, v in d.items()})
-                if isinstance(d, list):
-                    return [_dict_to_ns(x) for x in d]
-                return d
-
             config_path = Path(self.config.path) / "config.json"
             with open(config_path) as f:
-                self.model_config = _dict_to_ns(json.load(f))
+                config_dict = json.load(f)
+            # Top-level fields as attributes; nested dicts stay as dicts
+            # (code uses .get() on nested dicts like rope_parameters).
+            # text_config also needs attribute access (from_hf_config extracts it).
+            if "text_config" in config_dict and isinstance(config_dict["text_config"], dict):
+                config_dict["text_config"] = SimpleNamespace(**config_dict["text_config"])
+            self.model_config = SimpleNamespace(**config_dict)
         self._validate_model_type()
 
         self.spec: ModelSpec = get_model_spec(
