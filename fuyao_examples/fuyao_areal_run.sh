@@ -95,21 +95,26 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 # ========================== 3.5 Qwen3.5 运行时依赖 ==========================
+# AReaL 代码跑在 /AReaL/.venv/ 虚拟环境里，必须用 venv 的 pip 安装。
 # 1) transformers>=5.3.0 才支持 qwen3_5_moe model_type（veRL 同样升级）
 # 2) fla + causal-conv1d 是 GDN 核函数依赖
-if python -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
-    echo "[qwen3.5-deps] transformers already supports qwen3_5_moe, skip."
-else
-    echo "[qwen3.5-deps] Upgrading transformers + tokenizers for Qwen3.5..."
-    pip install --upgrade --no-cache-dir transformers tokenizers 2>&1 | tail -3
-    echo "[qwen3.5-deps] Done."
-fi
-if python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
-    echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
-else
-    echo "[qwen3.5-deps] Installing flash-linear-attention + causal-conv1d..."
-    pip install flash-linear-attention 2>&1 | tail -3
-    echo "[qwen3.5-deps] Done."
+VENV_PIP="/AReaL/.venv/bin/pip"
+VENV_PYTHON="/AReaL/.venv/bin/python"
+if [[ -x "$VENV_PIP" ]]; then
+    if $VENV_PYTHON -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
+        echo "[qwen3.5-deps] transformers already supports qwen3_5_moe, skip."
+    else
+        echo "[qwen3.5-deps] Upgrading transformers + tokenizers in venv..."
+        $VENV_PIP install --upgrade --no-cache-dir transformers tokenizers 2>&1 | tail -3
+        echo "[qwen3.5-deps] Done."
+    fi
+    if $VENV_PYTHON -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
+        echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
+    else
+        echo "[qwen3.5-deps] Installing flash-linear-attention + causal-conv1d in venv..."
+        $VENV_PIP install flash-linear-attention 2>&1 | tail -3
+        echo "[qwen3.5-deps] Done."
+    fi
 fi
 
 # ========================== 4. 清理残留进程 ==========================
