@@ -157,6 +157,26 @@ def freeze_moe_router(model: torch.nn.Module) -> int:
     return count
 
 
+def freeze_visual(model: torch.nn.Module) -> int:
+    """Freeze visual encoder weights for text-only RL training on VLM models.
+
+    Qwen3.5 is natively multimodal. When doing text-only RLVR, the visual
+    encoder should be frozen to save memory and avoid corrupting vision weights.
+
+    Args:
+        model: The model whose visual encoder should be frozen.
+
+    Returns:
+        Number of visual parameters frozen.
+    """
+    count = 0
+    for name, param in model.named_parameters():
+        if ".visual." in name or name.startswith("visual."):
+            param.requires_grad_(False)
+            count += 1
+    return count
+
+
 class ArchonEngine(TrainEngine):
     """Archon Engine is a torch-native training backend."""
 
