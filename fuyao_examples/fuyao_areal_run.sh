@@ -94,20 +94,12 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     exit 1
 fi
 
-# ========================== 3.5 Qwen3.5 运行时依赖 ==========================
-# AReaL 代码跑在 /AReaL/.venv/ 虚拟环境里，必须用 venv 的 pip 安装。
-# 1) transformers>=5.3.0 才支持 qwen3_5_moe model_type（veRL 同样升级）
-# 2) fla + causal-conv1d 是 GDN 核函数依赖
+# ========================== 3.5 Qwen3.5 GDN 运行时依赖 ==========================
+# fla + causal-conv1d 是 GDN 核函数依赖（训练侧需要）
+# transformers 升级不再需要 — archon_engine.py 已有 fallback 直接读 config.json
 VENV_PIP="/AReaL/.venv/bin/pip"
 VENV_PYTHON="/AReaL/.venv/bin/python"
 if [[ -x "$VENV_PIP" ]]; then
-    if $VENV_PYTHON -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'qwen3_5_moe' in CONFIG_MAPPING" 2>/dev/null; then
-        echo "[qwen3.5-deps] transformers already supports qwen3_5_moe, skip."
-    else
-        echo "[qwen3.5-deps] Upgrading transformers + tokenizers in venv..."
-        $VENV_PIP install --upgrade --no-cache-dir transformers tokenizers 2>&1 | tail -3
-        echo "[qwen3.5-deps] Done."
-    fi
     if $VENV_PYTHON -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule" 2>/dev/null; then
         echo "[qwen3.5-deps] flash-linear-attention already installed, skip."
     else

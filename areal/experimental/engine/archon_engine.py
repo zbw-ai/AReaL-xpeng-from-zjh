@@ -167,10 +167,22 @@ class ArchonEngine(TrainEngine):
         self.enable_tree_training = config.enable_tree_training
 
         # Model Configuration (loaded during __init__)
-        self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path=self.config.path,
-            trust_remote_code=True,
-        )
+        # AutoConfig requires model_type in CONFIG_MAPPING. For new models
+        # (e.g. qwen3_5_moe) not yet in the installed transformers version,
+        # load config.json directly and build a PretrainedConfig from it.
+        try:
+            self.model_config: PretrainedConfig = AutoConfig.from_pretrained(
+                pretrained_model_name_or_path=self.config.path,
+                trust_remote_code=True,
+            )
+        except (ValueError, KeyError):
+            import json
+            from pathlib import Path
+
+            config_path = Path(self.config.path) / "config.json"
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            self.model_config = PretrainedConfig(**config_dict)
         self._validate_model_type()
 
         self.spec: ModelSpec = get_model_spec(
