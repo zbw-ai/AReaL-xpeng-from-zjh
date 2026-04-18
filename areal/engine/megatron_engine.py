@@ -1392,14 +1392,21 @@ class MegatronEngine(TrainEngine):
 
     def _load_model_from_hf(self, path: str) -> None:
         assert self.model is not None, "Model is not initialized."
-        load_weights_from_hf_with_mbridge_fast(
-            bridge=self.bridge,
-            models=self.model,
-            weights_path=path,
-            max_workers=None,
-            is_critic=self.config.is_critic,
-            fp8_direct_convert=self.fp8_direct_convert,
-        )
+        if self.bridge is not None and not self.fp8_direct_convert:
+            # Use mbridge's native weight loading — it handles all architecture-
+            # specific conversion (QKV merge, gate_up fusion, TP/EP slicing)
+            # correctly, including VLM hybrid attention models like Qwen3.5.
+            self.bridge.load_weights(self.model, path)
+        else:
+            # Fallback for FP8 direct convert or non-mbridge models
+            load_weights_from_hf_with_mbridge_fast(
+                bridge=self.bridge,
+                models=self.model,
+                weights_path=path,
+                max_workers=None,
+                is_critic=self.config.is_critic,
+                fp8_direct_convert=self.fp8_direct_convert,
+            )
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
