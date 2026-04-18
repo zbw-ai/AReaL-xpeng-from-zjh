@@ -157,6 +157,10 @@ def _merge_gate_up_weights(
     tp_size: int,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
     """Merge gate_proj and up_proj into a single fc1 weight tensor."""
+    if len(hf_weights_safe_slice) == 1:
+        # Already-fused gate_up_proj (e.g. Qwen3.5 MoE experts) — just TP-slice.
+        x = hf_weights_safe_slice[0]
+        return x[_get_tp_slice(_get_shape(x), dim=0, tp_rank=tp_rank, tp_size=tp_size)]
     assert len(hf_weights_safe_slice) == 2, len(hf_weights_safe_slice)
     gate, up = hf_weights_safe_slice
     # chunk 0 for TP split
@@ -412,8 +416,12 @@ def _load_weight_with_bridge_worker(
         if is_te_fp8_param and enable_fp8_param and hf_has_fp8 and not hf_all_fp8:
             raise RuntimeError("Expected all inputs to be FP8 for TE FP8 parameter")
 
+        # For VLM configs (e.g. Qwen3_5MoeConfig), prefer text_config so
+        # num_attention_heads / head_dim come from the language model, not
+        # the vision encoder.
+        _hf_cfg = getattr(bridge.hf_config, "text_config", bridge.hf_config)
         param_to_load = _weight_to_mcore_tp(
-            hf_config=bridge.hf_config,
+            hf_config=_hf_cfg,
             mcore_weights_name=local_name,
             mcore_param_shape=list(param.shape),
             hf_weights_safe_slice=hf_weights_safe_slice,
