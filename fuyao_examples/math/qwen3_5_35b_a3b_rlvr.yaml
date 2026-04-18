@@ -43,7 +43,7 @@ rollout:
   backend: "sglang:d4t4"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  setup_timeout: 600.0
+  setup_timeout: 1200.0   # 35B MoE × DP4 over NFS needs >600s
   max_concurrent_rollouts: 64
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
