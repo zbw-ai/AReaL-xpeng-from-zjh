@@ -158,6 +158,11 @@ def _compute_stage_layer_lengths(
 def estimate_stage_parameter_buckets(
     hf_conf: PretrainedConfig, tf_conf: TransformerConfig
 ) -> tuple[list[float], float, float]:
+    # For VLM configs (e.g. Qwen3_5MoeConfig), resolve to text_config so
+    # hidden_size, num_attention_heads, etc. come from the language model,
+    # not from the vision encoder.
+    if hasattr(hf_conf, "text_config") and hf_conf.text_config is not None:
+        hf_conf = hf_conf.text_config
     total_layers = getattr(tf_conf, "num_layers", None)
     if not isinstance(total_layers, int) or total_layers <= 0:
         total_layers = getattr(hf_conf, "num_hidden_layers", 0)
