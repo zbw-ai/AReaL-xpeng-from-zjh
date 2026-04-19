@@ -104,6 +104,17 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
+# SGLang >=0.5.10 required for Qwen3.5 VLM (text_config.num_attention_heads fix)
+SGLANG_VER=$(python -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
+if python -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} OK"
+else
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, upgrading from PyPI..."
+    pip install --upgrade "sglang[all]>=0.5.10" --no-deps 2>/dev/null \
+        || pip install --upgrade "sglang>=0.5.10" --no-deps 2>/dev/null \
+        || echo "[qwen3.5-deps] WARNING: SGLang upgrade failed. Qwen3.5 inference may not work."
+fi
+
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
 for pid_file in "${RUN_STATE_DIR}"/*.pid; do
