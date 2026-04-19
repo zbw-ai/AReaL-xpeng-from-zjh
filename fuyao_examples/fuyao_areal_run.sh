@@ -105,14 +105,19 @@ else
 fi
 
 # SGLang >=0.5.10 required for Qwen3.5 VLM (text_config.num_attention_heads fix)
-SGLANG_VER=$(python -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
-if python -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
+# Must use the venv pip — SGLang lives in /AReaL/.venv/, not system Python.
+VENV_PIP="${PROJECT_ROOT}/.venv/bin/pip"
+VENV_PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+SGLANG_VER=$($VENV_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
+if $VENV_PYTHON -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
     echo "[qwen3.5-deps] SGLang ${SGLANG_VER} OK"
 else
-    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, upgrading from PyPI..."
-    pip install --upgrade "sglang[all]>=0.5.10" --no-deps 2>/dev/null \
-        || pip install --upgrade "sglang>=0.5.10" --no-deps 2>/dev/null \
-        || echo "[qwen3.5-deps] WARNING: SGLang upgrade failed. Qwen3.5 inference may not work."
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, upgrading via venv pip..."
+    $VENV_PIP install --upgrade "sglang>=0.5.10" 2>&1 | tail -5 \
+        || echo "[qwen3.5-deps] WARNING: SGLang upgrade failed. Need image with SGLang>=0.5.10."
+    # Verify
+    NEW_VER=$($VENV_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "unknown")
+    echo "[qwen3.5-deps] SGLang version after upgrade: ${NEW_VER}"
 fi
 
 # ========================== 4. 清理残留进程 ==========================
