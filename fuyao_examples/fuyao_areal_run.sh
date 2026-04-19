@@ -104,16 +104,32 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# SGLang Qwen3.5 VLM compatibility patch
-# SGLang 0.5.9 asserts config.text_config.num_attention_heads which fails for
-# Qwen3.5 VLM (Qwen3_5MoeConfig). Patch the source file on ALL nodes to remove
-# the strict assertion — SGLang can infer head count from the model weights.
-SGLANG_HF_UTILS="/AReaL/.venv/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py"
-if [ -f "$SGLANG_HF_UTILS" ] && grep -q 'assert hasattr(config.text_config, "num_attention_heads")' "$SGLANG_HF_UTILS"; then
-    sed -i 's/assert hasattr(config.text_config, "num_attention_heads")/pass  # patched: Qwen3.5 VLM text_config compatibility/' "$SGLANG_HF_UTILS"
-    echo "[qwen3.5-deps] Patched SGLang get_hf_text_config for Qwen3.5 VLM"
+# SGLang >=0.5.10 for Qwen3.5 VLM support
+# Try pip upgrade first; if PyPI blocked, fall back to sed-patch the assertion.
+AREAL_PIP="/AReaL/.venv/bin/pip"
+AREAL_PYTHON="/AReaL/.venv/bin/python"
+SGLANG_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
+NEED_PATCH=true
+if $AREAL_PYTHON -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} >= 0.5.10, OK"
+    NEED_PATCH=false
 else
-    echo "[qwen3.5-deps] SGLang patch not needed (already patched or >=0.5.10)"
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, upgrading..."
+    if $AREAL_PIP install --upgrade "sglang>=0.5.10" 2>&1 | tail -3; then
+        NEW_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "unknown")
+        echo "[qwen3.5-deps] SGLang upgraded to ${NEW_VER}"
+        NEED_PATCH=false
+    else
+        echo "[qwen3.5-deps] pip upgrade failed, applying sed patch..."
+    fi
+fi
+# Fallback: sed-patch the assertion if upgrade failed
+if $NEED_PATCH; then
+    SGLANG_HF_UTILS="/AReaL/.venv/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py"
+    if [ -f "$SGLANG_HF_UTILS" ] && grep -q 'assert hasattr(config.text_config, "num_attention_heads")' "$SGLANG_HF_UTILS"; then
+        sed -i 's/assert hasattr(config.text_config, "num_attention_heads")/pass  # patched: Qwen3.5 VLM/' "$SGLANG_HF_UTILS"
+        echo "[qwen3.5-deps] Patched SGLang for Qwen3.5 VLM compatibility"
+    fi
 fi
 
 # ========================== 4. 清理残留进程 ==========================
