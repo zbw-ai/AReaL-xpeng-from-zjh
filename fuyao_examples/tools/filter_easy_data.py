@@ -55,7 +55,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Filter easy data (POLARIS-style)")
     p.add_argument("--dataset-path", required=True, help="Path to dataset dir or parquet")
     p.add_argument("--dataset-type", default="dapo_math", choices=["dapo_math", "deepmath"])
-    p.add_argument("--server-url", default="http://localhost:30000", help="SGLang server URL")
+    p.add_argument("--server-url", default="http://localhost:30000",
+                   help="SGLang server URL(s), comma-separated for multi-instance")
     p.add_argument("--n-samples", type=int, default=8, help="Rollouts per prompt")
     p.add_argument("--temperature", type=float, default=1.4)
     p.add_argument("--max-tokens", type=int, default=31744)
@@ -172,10 +173,15 @@ def run_filter(args):
     results = []
     failed = 0
 
+    server_urls = [u.strip() for u in args.server_url.split(",")]
+    print(f"Using {len(server_urls)} server(s): {server_urls}")
+
     def process_one(idx, sample):
+        # Round-robin across servers
+        url = server_urls[idx % len(server_urls)]
         try:
             completions = generate_one(
-                args.server_url, sample["prompt"],
+                url, sample["prompt"],
                 args.n_samples, args.temperature, args.max_tokens,
             )
             result = score_sample(sample["prompt"], completions, sample["answer"])

@@ -42,10 +42,11 @@ MAX_TOKENS="${MAX_TOKENS:-8192}"      # 最大生成长度 (训练 avg=3.4K, 8K 
 THRESHOLD="${THRESHOLD:-0.9}"         # avg_reward > 此值的题被 drop
 BATCH_SIZE="${BATCH_SIZE:-32}"        # 并发请求数
 
-# SGLang 参数
+# SGLang 参数 — 8 GPU: TP4 x DP2 (2个 SGLang 实例，翻倍吞吐)
 TP="${TP:-4}"
-SGLANG_PORT=30000
-SGLANG_URL="http://localhost:${SGLANG_PORT}"
+NUM_INSTANCES="${NUM_INSTANCES:-2}"
+SGLANG_BASE_PORT=30000
+SGLANG_URL="http://localhost:${SGLANG_BASE_PORT}"
 
 echo "================================================================"
 echo " POLARIS-style Easy Data Filter"
@@ -64,38 +65,67 @@ fi
 echo "[1/4] Checkpoint exists: $(ls ${CKPT_PATH}/*.safetensors 2>/dev/null | wc -l) safetensors files"
 
 # ========================== 2. 启动 SGLang server ==========================
-echo "[2/4] Starting SGLang server (TP=${TP}, port=${SGLANG_PORT})..."
+echo "[2/4] Starting ${NUM_INSTANCES} SGLang server(s) (TP=${TP}, 8 GPU total)..."
 
-python3 -m sglang.launch_server \
-    --model-path "${CKPT_PATH}" \
-    --tp "${TP}" \
-    --port "${SGLANG_PORT}" \
-    --dtype bfloat16 \
-    --mem-fraction-static 0.85 \
-    --disable-custom-all-reduce \
-    --context-length 9216 \
-    &
-SGLANG_PID=$!
+SGLANG_PIDS=()
+SGLANG_URLS=()
 
-# 等待 server 就绪
-echo "Waiting for SGLang server to be ready..."
+for i in $(seq 0 $((NUM_INSTANCES - 1))); do
+    PORT=$((SGLANG_BASE_PORT + i))
+    FIRST_GPU=$((i * TP))
+    GPU_LIST=$(seq -s, ${FIRST_GPU} $((FIRST_GPU + TP - 1)))
+
+    echo "  Instance ${i}: GPU [${GPU_LIST}], port ${PORT}"
+    CUDA_VISIBLE_DEVICES="${GPU_LIST}" python3 -m sglang.launch_server \
+        --model-path "${CKPT_PATH}" \
+        --tp "${TP}" \
+        --port "${PORT}" \
+        --dtype bfloat16 \
+        --mem-fraction-static 0.85 \
+        --disable-custom-all-reduce \
+        --context-length 9216 \
+        &
+    SGLANG_PIDS+=($!)
+    SGLANG_URLS+=("http://localhost:${PORT}")
+done
+
+# 等待所有 server 就绪
+echo "Waiting for SGLang servers to be ready..."
 MAX_WAIT=600
 ELAPSED=0
-while ! curl -sf "${SGLANG_URL}/health" > /dev/null 2>&1; do
-    if ! kill -0 ${SGLANG_PID} 2>/dev/null; then
-        echo "ERROR: SGLang server process died"
-        exit 1
-    fi
+ALL_READY=false
+while ! $ALL_READY; do
+    ALL_READY=true
+    for url in "${SGLANG_URLS[@]}"; do
+        if ! curl -sf "${url}/health" > /dev/null 2>&1; then
+            ALL_READY=false
+            break
+        fi
+    done
+    if $ALL_READY; then break; fi
+
+    # Check if any process died
+    for pid in "${SGLANG_PIDS[@]}"; do
+        if ! kill -0 ${pid} 2>/dev/null; then
+            echo "ERROR: SGLang server process ${pid} died"
+            for p in "${SGLANG_PIDS[@]}"; do kill ${p} 2>/dev/null || true; done
+            exit 1
+        fi
+    done
+
     if [ ${ELAPSED} -ge ${MAX_WAIT} ]; then
-        echo "ERROR: SGLang server did not start within ${MAX_WAIT}s"
-        kill ${SGLANG_PID} 2>/dev/null || true
+        echo "ERROR: SGLang servers did not start within ${MAX_WAIT}s"
+        for p in "${SGLANG_PIDS[@]}"; do kill ${p} 2>/dev/null || true; done
         exit 1
     fi
     sleep 5
     ELAPSED=$((ELAPSED + 5))
     echo "  Waiting... ${ELAPSED}s"
 done
-echo "SGLang server ready! (took ${ELAPSED}s)"
+echo "All ${NUM_INSTANCES} SGLang servers ready! (took ${ELAPSED}s)"
+
+# 构建逗号分隔的 URL 列表传给 filter 脚本
+SGLANG_URL_LIST=$(IFS=,; echo "${SGLANG_URLS[*]}")
 
 # ========================== 3. 运行过滤 ==========================
 echo "[3/4] Running data filter..."
@@ -104,7 +134,7 @@ mkdir -p "${OUTPUT_DIR}"
 python3 fuyao_examples/tools/filter_easy_data.py \
     --dataset-path "${DATASET_PATH}" \
     --dataset-type "${DATASET_TYPE}" \
-    --server-url "${SGLANG_URL}" \
+    --server-url "${SGLANG_URL_LIST}" \
     --n-samples "${N_SAMPLES}" \
     --temperature "${TEMPERATURE}" \
     --max-tokens "${MAX_TOKENS}" \
@@ -115,9 +145,11 @@ python3 fuyao_examples/tools/filter_easy_data.py \
 FILTER_EXIT=$?
 
 # ========================== 4. 清理 ==========================
-echo "[4/4] Stopping SGLang server..."
-kill ${SGLANG_PID} 2>/dev/null || true
-wait ${SGLANG_PID} 2>/dev/null || true
+echo "[4/4] Stopping SGLang servers..."
+for pid in "${SGLANG_PIDS[@]}"; do
+    kill ${pid} 2>/dev/null || true
+    wait ${pid} 2>/dev/null || true
+done
 
 if [ ${FILTER_EXIT} -eq 0 ]; then
     echo ""
