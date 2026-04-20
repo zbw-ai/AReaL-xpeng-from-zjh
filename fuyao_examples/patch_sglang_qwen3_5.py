@@ -18,16 +18,22 @@ PATCH_MARKER = "# PATCHED_QWEN3_5_VLM_V3"
 # Code to inject: recursively converts dict attrs on any config object
 DICT_FIX_CODE = '''
 def _fix_dict_configs(config):
-    """Recursively convert dict attributes to SimpleNamespace for attribute access."""
+    """Convert known sub-config dict attributes to SimpleNamespace for attribute access.
+    Only converts fields that are model sub-configs (text_config, vision_config, etc.),
+    NOT data dicts like label2id which HF validates as dict type."""
     from types import SimpleNamespace
-    for attr in list(vars(config)):
-        val = getattr(config, attr)
-        if isinstance(val, dict) and not attr.startswith("_"):
-            # Only convert if all keys are strings (skip dicts with int keys like layer indices)
-            if all(isinstance(k, str) for k in val):
-                ns = SimpleNamespace(**val)
-                _fix_dict_configs(ns)  # recurse
+    _CONFIG_FIELDS = {"text_config", "vision_config", "audio_config",
+                      "language_config", "visual_config", "encoder_config",
+                      "decoder_config", "pooler_config"}
+    for attr in _CONFIG_FIELDS:
+        val = getattr(config, attr, None)
+        if isinstance(val, dict):
+            ns = SimpleNamespace(**val)
+            _fix_dict_configs(ns)  # recurse nested sub-configs
+            try:
                 setattr(config, attr, ns)
+            except Exception:
+                pass  # skip if HF strict validation rejects it
     return config
 '''
 
