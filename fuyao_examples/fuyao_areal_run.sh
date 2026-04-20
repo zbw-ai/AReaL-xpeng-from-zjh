@@ -105,30 +105,21 @@ else
 fi
 
 # SGLang >=0.5.10 for Qwen3.5 VLM support
-# Try pip upgrade first; if PyPI blocked, fall back to sed-patch the assertion.
+# Try pip upgrade first; if that fails, apply Python monkey-patch to source files.
 AREAL_PIP="/AReaL/.venv/bin/pip"
-AREAL_PYTHON="/AReaL/.venv/bin/python"
+AREAL_PYTHON="/AReaL/.venv/bin/python3"
 SGLANG_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
-NEED_PATCH=true
 if $AREAL_PYTHON -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
     echo "[qwen3.5-deps] SGLang ${SGLANG_VER} >= 0.5.10, OK"
-    NEED_PATCH=false
 else
-    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, upgrading..."
-    if $AREAL_PIP install --upgrade "sglang>=0.5.10" 2>&1 | tail -3; then
-        NEW_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "unknown")
+    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, trying pip upgrade..."
+    $AREAL_PIP install --upgrade "sglang>=0.5.10" 2>&1 | tail -3 || true
+    NEW_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
+    if $AREAL_PYTHON -c "from packaging.version import Version; exit(0 if Version('${NEW_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
         echo "[qwen3.5-deps] SGLang upgraded to ${NEW_VER}"
-        NEED_PATCH=false
     else
-        echo "[qwen3.5-deps] pip upgrade failed, applying sed patch..."
-    fi
-fi
-# Fallback: sed-patch the assertion if upgrade failed
-if $NEED_PATCH; then
-    SGLANG_HF_UTILS="/AReaL/.venv/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py"
-    if [ -f "$SGLANG_HF_UTILS" ] && grep -q 'assert hasattr(config.text_config, "num_attention_heads")' "$SGLANG_HF_UTILS"; then
-        sed -i 's/assert hasattr(config.text_config, "num_attention_heads")/pass  # patched: Qwen3.5 VLM/' "$SGLANG_HF_UTILS"
-        echo "[qwen3.5-deps] Patched SGLang for Qwen3.5 VLM compatibility"
+        echo "[qwen3.5-deps] pip failed (${NEW_VER}), applying source patch..."
+        $AREAL_PYTHON "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
     fi
 fi
 
