@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 SGLANG_ROOT = Path("/AReaL/.venv/lib/python3.12/site-packages/sglang/srt")
-PATCH_MARKER = "# PATCHED_QWEN3_5_VLM_V3"
+PATCH_MARKER = "# PATCHED_QWEN3_5_VLM_V4"
 
 # Code to inject: recursively converts dict attrs on any config object
 DICT_FIX_CODE = '''
@@ -50,9 +50,13 @@ def patch():
         print("[sglang-patch] Already patched.")
         return True
 
-    # Remove old patch markers if present
-    for old_marker in ["# PATCHED_FOR_QWEN3_5_VLM", "# PATCHED_FOR_QWEN3_5_VLM_V2"]:
+    # Remove ALL old patch markers and injected code to start fresh
+    for old_marker in ["# PATCHED_FOR_QWEN3_5_VLM", "# PATCHED_FOR_QWEN3_5_VLM_V2",
+                        "# PATCHED_QWEN3_5_VLM_V3"]:
         code = code.replace(old_marker, "")
+    # Remove previously injected _fix_dict_configs function
+    import re
+    code = re.sub(r'def _fix_dict_configs\(config\):.*?return config\n', '', code, flags=re.DOTALL)
 
     # 1. Add the helper function at the top of the file
     code = DICT_FIX_CODE + "\n" + code
