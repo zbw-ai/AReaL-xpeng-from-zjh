@@ -23,9 +23,11 @@ def _fix_dict_configs(config):
     for attr in list(vars(config)):
         val = getattr(config, attr)
         if isinstance(val, dict) and not attr.startswith("_"):
-            ns = SimpleNamespace(**val)
-            _fix_dict_configs(ns)  # recurse
-            setattr(config, attr, ns)
+            # Only convert if all keys are strings (skip dicts with int keys like layer indices)
+            if all(isinstance(k, str) for k in val):
+                ns = SimpleNamespace(**val)
+                _fix_dict_configs(ns)  # recurse
+                setattr(config, attr, ns)
     return config
 '''
 
