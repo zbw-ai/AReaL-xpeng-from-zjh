@@ -8,4 +8,7 @@ ENV MAX_JOBS=1
 RUN pip install --upgrade --target /AReaL/.venv/lib/python3.12/site-packages \
     "sglang>=0.5.10" \
     transformers tokenizers \
-    git+https://github.com/ISEEKYAN/mbridge.git
+    git+https://github.com/ISEEKYAN/mbridge.git && \
+    # Fix Ray dependency broken by sglang upgrade (opencensus → google.rpc)
+    pip install --target /AReaL/.venv/lib/python3.12/site-packages \
+    googleapis-common-protos
