@@ -36,7 +36,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-/workspace/zengbw1@xiaopeng.com/dataset/dapo_math}"
 OUTPUT_FILE="${OUTPUT_DIR}/dapo_math_stage2_filtered.parquet"
 
 # 过滤参数
-N_SAMPLES="${N_SAMPLES:-4}"           # 每个 prompt 生成几个 response (4 够判断难度)
+N_SAMPLES="${N_SAMPLES:-8}"           # 每个 prompt 生成几个 response (与训练一致)
 TEMPERATURE="${TEMPERATURE:-1.4}"     # 采样温度
 MAX_TOKENS="${MAX_TOKENS:-8192}"      # 最大生成长度 (训练 avg=3.4K, 8K 足够)
 THRESHOLD="${THRESHOLD:-0.9}"         # avg_reward > 此值的题被 drop
