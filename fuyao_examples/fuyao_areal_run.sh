@@ -163,10 +163,9 @@ export NCCL_MAX_NCHANNELS=16
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# SGLang: allow context_length > model's derived max_position_embeddings
-# Qwen3.5 VLM config reports max_position_embeddings=2048 but the language
-# model actually supports longer contexts via RoPE scaling.
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+# SGLang compatibility
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1  # Qwen3.5 VLM: derived 2048 < actual
+export SGLANG_DISABLE_CUDNN_CHECK=1                  # PyTorch 2.9.1 + CuDNN 9.10 (Conv3d bug, not relevant for LLM)
 
 # Python 配置
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
