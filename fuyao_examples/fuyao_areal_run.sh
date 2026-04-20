@@ -104,24 +104,10 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# SGLang >=0.5.10 for Qwen3.5 VLM support
-# Try pip upgrade first; if that fails, apply Python monkey-patch to source files.
-AREAL_PIP="/AReaL/.venv/bin/pip"
-AREAL_PYTHON="/AReaL/.venv/bin/python3"
-SGLANG_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
-if $AREAL_PYTHON -c "from packaging.version import Version; exit(0 if Version('${SGLANG_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
-    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} >= 0.5.10, OK"
-else
-    echo "[qwen3.5-deps] SGLang ${SGLANG_VER} < 0.5.10, trying pip upgrade..."
-    $AREAL_PIP install --upgrade "sglang>=0.5.10" 2>&1 | tail -3 || true
-    NEW_VER=$($AREAL_PYTHON -c "import sglang; print(sglang.__version__)" 2>/dev/null || echo "0.0.0")
-    if $AREAL_PYTHON -c "from packaging.version import Version; exit(0 if Version('${NEW_VER}') >= Version('0.5.10') else 1)" 2>/dev/null; then
-        echo "[qwen3.5-deps] SGLang upgraded to ${NEW_VER}"
-    else
-        echo "[qwen3.5-deps] pip failed (${NEW_VER}), applying source patch..."
-        $AREAL_PYTHON "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
-    fi
-fi
+# SGLang Qwen3.5 VLM patch — ALWAYS apply regardless of version.
+# transformers 5.x returns text_config as dict for Qwen3.5, breaking SGLang
+# in both 0.5.9 and 0.5.10. Patch converts dict→object at the source.
+python3 "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
