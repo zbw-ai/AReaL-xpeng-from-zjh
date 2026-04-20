@@ -68,15 +68,18 @@ def plot_benchmark_comparison():
     step199 = [79.17, 73.33, 57.13, 95.00, 55.65, 94.45, 75.79]
     step299 = [81.25, 69.58, 56.38, 95.00, 55.35, 94.13, 75.28]
     step499 = [77.08, 73.75, 55.93, 95.07, 55.80, 94.25, 75.31]
+    step699 = [79.58, 70.83, 54.61, 95.07, 55.87, 94.15, 74.95]
+    step799 = [76.67, 70.00, 56.50, 94.77, 55.20, 94.43, 74.59]
 
     x = np.arange(len(benchmarks))
-    width = 0.2
+    width = 0.15
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    bars1 = ax.bar(x - 1.5 * width, base, width, label="Qwen3-4B base", color=COLORS[5], alpha=0.7)
-    bars2 = ax.bar(x - 0.5 * width, step199, width, label="step199 (best avg)", color=COLORS[0])
-    bars3 = ax.bar(x + 0.5 * width, step299, width, label="step299 (best AIME24)", color=COLORS[1])
-    bars4 = ax.bar(x + 1.5 * width, step499, width, label="step499 (best AIME25)", color=COLORS[2])
+    bars1 = ax.bar(x - 2 * width, base, width, label="Qwen3-4B base", color=COLORS[5], alpha=0.7)
+    bars2 = ax.bar(x - width, step199, width, label="step199 (best avg)", color=COLORS[0])
+    bars3 = ax.bar(x, step299, width, label="step299 (best AIME24)", color=COLORS[1])
+    bars4 = ax.bar(x + width, step499, width, label="step499 (best AIME25)", color=COLORS[2])
+    bars5 = ax.bar(x + 2 * width, step799, width, label="step799 (degraded)", color=COLORS[3], alpha=0.5)
 
     # POLARIS reference for AIME
     ax.plot([0 - 0.2, 0 + 0.2], [81.2, 81.2], color=COLORS[3], linewidth=3, label="POLARIS-4B (AIME ref)")
@@ -90,12 +93,12 @@ def plot_benchmark_comparison():
     ax.set_ylim(50, 100)
 
     # Add value labels on AIME bars
-    for bar_group in [bars2, bars3, bars4]:
+    for bar_group in [bars2, bars3, bars4, bars5]:
         for i, bar in enumerate(bar_group):
             if i < 2:  # Only label AIME bars
                 height = bar.get_height()
                 ax.annotate(f"{height:.1f}", xy=(bar.get_x() + bar.get_width() / 2, height),
-                           xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=7)
+                           xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=6)
 
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_DIR, "benchmark_comparison.png"), dpi=FIG_DPI, bbox_inches="tight")
@@ -111,20 +114,23 @@ def plot_delta_analysis():
     delta_199 = [2.09, 3.33, 1.70, -0.22, 1.28, 0.25]
     # Delta from base at step299
     delta_299 = [4.17, -0.42, 0.95, -0.22, 0.98, -0.07]
+    # Delta from base at step799 (degraded)
+    delta_799 = [-0.41, 0.00, 1.07, -0.45, 0.83, 0.23]
     # POLARIS delta (only AIME available)
     polaris_delta = [4.12, 9.40, None, None, None, None]
 
     x = np.arange(len(benchmarks))
-    width = 0.25
+    width = 0.2
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    ax.bar(x - width, delta_199, width, label="step199 (best avg)", color=COLORS[0])
-    ax.bar(x, delta_299, width, label="step299 (best AIME24)", color=COLORS[1])
+    ax.bar(x - 1.5 * width, delta_199, width, label="step199 (best avg)", color=COLORS[0])
+    ax.bar(x - 0.5 * width, delta_299, width, label="step299 (best AIME24)", color=COLORS[1])
+    ax.bar(x + 0.5 * width, delta_799, width, label="step799 (degraded)", color=COLORS[3], alpha=0.5)
 
     # POLARIS reference
     for i, val in enumerate(polaris_delta):
         if val is not None:
-            ax.bar(x[i] + width, val, width, color=COLORS[3], alpha=0.7,
+            ax.bar(x[i] + 1.5 * width, val, width, color=COLORS[4], alpha=0.7,
                    label="POLARIS-4B" if i == 0 else "")
 
     ax.axhline(y=0, color="black", linewidth=0.8)
