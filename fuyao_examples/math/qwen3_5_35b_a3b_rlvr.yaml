@@ -161,9 +161,7 @@ vllm:
   max_num_seqs: 64
   max_model_len: 10240
   gpu_memory_utilization: 0.8
-  disable_custom_all_reduce: true
   enforce_eager: true
-  trust_remote_code: true
 
 # ── Datasets — dapo_math_17k ──
 train_dataset:
