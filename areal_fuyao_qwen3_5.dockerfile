@@ -2,7 +2,10 @@ FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:areal-qwe
 ENV MAX_JOBS=1
 
 # 不和 megatron/ 命名空间冲突的包直接 --target 装
+# transformers 降到 4.57.1：5.5.4 对 Qwen3.5 VLM 返回 dict text_config，SGLang 不兼容。
+# Megatron 训练侧用 mbridge 不依赖 transformers 版本。
 RUN pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
+        transformers==4.57.1 \
         vllm==0.18.0 \
         sglang==0.5.10.post1 \
         sglang-kernel==0.4.1 \
