@@ -104,13 +104,8 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# Qwen3.5 VLM: pin transformers + patch SGLang assertion
-# transformers pin: registers qwen3_5_moe properly
-pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
-    "transformers @ git+https://github.com/huggingface/transformers.git@d64a6d67d8c004a25570db4df5689e06caea6af7" \
-    2>&1 | tail -3 || echo "[qwen3.5-deps] WARNING: transformers install failed (GitHub may be blocked)"
-# SGLang patch: always needed regardless of transformers version
-python3 "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
+# Qwen3.5 VLM: veRL uses SGLang 0.5.9 + original transformers (no upgrades).
+# Do NOT upgrade transformers or patch SGLang — the v1 base image works as-is.
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
