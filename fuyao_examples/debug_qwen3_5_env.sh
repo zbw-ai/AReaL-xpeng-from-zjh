@@ -18,10 +18,35 @@ echo "========================================="
 echo ""
 echo "===== Step 1: 检查包版本 ====="
 python3 -c "
-import transformers; print(f'transformers: {transformers.__version__}')
-import sglang; print(f'sglang: {sglang.__version__}')
-import torch; print(f'torch: {torch.__version__}')
-import ray; print(f'ray: {ray.__version__}')
+import importlib.metadata as metadata
+
+def show_version(dist_name, label=None):
+    label = label or dist_name
+    try:
+        print(f'{label}: {metadata.version(dist_name)}')
+    except metadata.PackageNotFoundError:
+        print(f'{label}: NOT INSTALLED')
+    except Exception as e:
+        print(f'{label}: ERROR ({type(e).__name__}: {e})')
+
+show_version('transformers')
+show_version('huggingface-hub', 'huggingface_hub')
+show_version('tokenizers')
+show_version('sglang')
+show_version('torch')
+show_version('ray')
+
+try:
+    import transformers
+    print(f'transformers import: OK ({transformers.__version__})')
+except Exception as e:
+    print(f'❌ transformers import failed: {type(e).__name__}: {e}')
+    if 'is_offline_mode' in str(e):
+        print('   可能原因: transformers 与 huggingface_hub 版本不兼容')
+        print('   建议修复 A (Qwen3.5 推荐): uv pip install --upgrade transformers tokenizers')
+        print('   建议修复 B (仅兼容 4.x): uv pip install \"huggingface_hub<1.0\"')
+    raise SystemExit(2)
+
 try:
     import mbridge; print(f'mbridge: OK')
 except: print('mbridge: NOT FOUND')
@@ -65,13 +90,54 @@ except Exception as e:
 echo ""
 echo "===== Step 4: 检查 mbridge 能否加载模型 ====="
 python3 -c "
+import socket
+
 try:
     import mbridge
-    bridge = mbridge.AutoBridge.from_pretrained('${MODEL_PATH}', dtype='bfloat16')
+    import torch.distributed as dist
+    from megatron.core import parallel_state as mpu
+
+    def find_free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend='gloo',
+            init_method=f'tcp://127.0.0.1:{find_free_port()}',
+            rank=0,
+            world_size=1,
+        )
+    if not mpu.model_parallel_is_initialized():
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            use_sharp=False,
+            order='tp-cp-ep-dp-pp',
+        )
+
+    bridge = mbridge.AutoBridge.from_pretrained(
+        '${MODEL_PATH}', trust_remote_code=True, dtype='bfloat16'
+    )
     print(f'✅ mbridge 加载成功: {type(bridge).__name__}')
     print(f'   hf_config: {type(bridge.hf_config).__name__}')
 except Exception as e:
     print(f'❌ mbridge 加载失败: {e}')
+finally:
+    try:
+        if 'mpu' in globals() and mpu.model_parallel_is_initialized():
+            mpu.destroy_model_parallel()
+    except Exception:
+        pass
+    try:
+        if 'dist' in globals() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception:
+        pass
 "
 
 echo ""
@@ -98,7 +164,7 @@ except Exception as e:
 echo ""
 echo "===== Step 6: 尝试启动 SGLang server (10s 超时) ====="
 echo "启动 SGLang server..."
-timeout 30 python3 -m sglang.launch_server \
+SGLANG_OUTPUT="$(timeout 30 python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --tp 1 \
     --mem-fraction-static 0.5 \
@@ -106,7 +172,15 @@ timeout 30 python3 -m sglang.launch_server \
     --host 127.0.0.1 \
     --port 30000 \
     --disable-custom-all-reduce \
-    2>&1 | head -50 || echo "(超时或退出 — 查看上面的输出判断是否成功)"
+    2>&1 || true)"
+printf '%s\n' "${SGLANG_OUTPUT}" | head -50
+if printf '%s' "${SGLANG_OUTPUT}" | grep -q "SGLANG_DISABLE_CUDNN_CHECK=1"; then
+    echo "提示: 当前被 SGLang 的 CuDNN 兼容性检查拦截。"
+    echo "  临时跳过检查: export SGLANG_DISABLE_CUDNN_CHECK=1"
+    echo "  推荐修复: pip install nvidia-cudnn-cu12==9.16.0.29"
+elif [ -z "${SGLANG_OUTPUT}" ]; then
+    echo "(超时或退出 — 查看上面的输出判断是否成功)"
+fi
 
 echo ""
 echo "===== 调试完成 ====="
