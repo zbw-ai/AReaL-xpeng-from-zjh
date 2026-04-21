@@ -12,8 +12,10 @@ RUN rm -rf /AReaL/.venv/lib/python3.12/site-packages/transformers* \
     "torch==2.9.1" \
     "transformers @ git+https://github.com/huggingface/transformers.git@cc7ab9be"
 
-# mbridge: install the latest bridge registry without disturbing the HF stack above.
-RUN pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
+# mbridge: install WITH deps (--no-deps misses sub-modules that register qwen3_5_moe bridge).
+# Also rm old mbridge to avoid --target overlay issues.
+RUN rm -rf /AReaL/.venv/lib/python3.12/site-packages/mbridge* && \
+    pip install --upgrade --target /AReaL/.venv/lib/python3.12/site-packages \
     git+https://github.com/ISEEKYAN/mbridge.git
 
 # SGLang on torch 2.9.1 requires CuDNN >= 9.15 at runtime. Unpack the wheel payload
