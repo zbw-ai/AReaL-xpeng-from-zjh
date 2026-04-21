@@ -42,11 +42,11 @@ MAX_TOKENS="${MAX_TOKENS:-8192}"      # 最大生成长度 (训练 avg=3.4K, 8K 
 THRESHOLD="${THRESHOLD:-0.9}"         # avg_reward > 此值的题被 drop
 BATCH_SIZE="${BATCH_SIZE:-32}"        # 并发请求数
 
-# SGLang 参数 — 8 GPU: TP4 x DP2 (2个 SGLang 实例，翻倍吞吐)
+# SGLang 参数 — 自动检测 GPU 数量，启动尽可能多的 TP4 实例
 TP="${TP:-4}"
-NUM_INSTANCES="${NUM_INSTANCES:-2}"
+TOTAL_GPUS="${SLURM_GPUS_PER_NODE:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+NUM_INSTANCES="${NUM_INSTANCES:-$((TOTAL_GPUS / TP))}"
 SGLANG_BASE_PORT=30000
-SGLANG_URL="http://localhost:${SGLANG_BASE_PORT}"
 
 echo "================================================================"
 echo " POLARIS-style Easy Data Filter"

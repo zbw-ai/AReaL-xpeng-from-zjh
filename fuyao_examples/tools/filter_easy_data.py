@@ -160,24 +160,51 @@ def score_sample(prompt: str, completions: list[str], answer: str) -> dict:
 
 
 def run_filter(args):
-    """Main filter mode: generate, score, filter, save."""
+    """Main filter mode: generate, score, filter, save.
+
+    Resilient design:
+    - Per-future timeout (REQUEST_TIMEOUT_S) prevents single requests from blocking
+    - Incremental checkpoint saves progress every CHECKPOINT_INTERVAL samples
+    - Resumes from checkpoint if output.progress.json exists
+    """
+    REQUEST_TIMEOUT_S = 300  # per-request hard timeout (kill stuck futures)
+    CHECKPOINT_INTERVAL = 500  # save progress every N completions
+
     print(f"Loading dataset from {args.dataset_path} (type={args.dataset_type})")
     samples, raw_df = load_dataset_samples(args.dataset_path, args.dataset_type)
     if args.max_samples:
         samples = samples[: args.max_samples]
     print(f"Total samples: {len(samples)}")
 
-    print(f"\nGenerating {args.n_samples} completions per prompt (temp={args.temperature})...")
-    print(f"Server: {args.server_url}")
-
-    results = []
-    failed = 0
-
     server_urls = [u.strip() for u in args.server_url.split(",")]
     print(f"Using {len(server_urls)} server(s): {server_urls}")
 
+    # Resume from checkpoint if exists
+    output_path = Path(args.output)
+    progress_path = output_path.with_suffix(".progress.json")
+    results = []
+    done_indices = set()
+    if progress_path.exists():
+        with open(progress_path) as f:
+            saved = json.load(f)
+        results = saved.get("results", [])
+        done_indices = {r["idx"] for r in results}
+        print(f"Resumed from checkpoint: {len(results)} already scored, "
+              f"skipping {len(done_indices)} samples")
+
+    remaining = [s for s in samples if s["idx"] not in done_indices]
+    print(f"Remaining to score: {len(remaining)}")
+    if not remaining:
+        print("All samples already scored!")
+    else:
+        print(f"\nGenerating {args.n_samples} completions per prompt "
+              f"(temp={args.temperature}, timeout={REQUEST_TIMEOUT_S}s)...")
+
+    failed = 0
+    timed_out = 0
+    total_done = len(done_indices)
+
     def process_one(idx, sample):
-        # Round-robin across servers
         url = server_urls[idx % len(server_urls)]
         try:
             completions = generate_one(
@@ -188,26 +215,50 @@ def run_filter(args):
             result["idx"] = sample["idx"]
             return result
         except Exception as e:
-            return {"error": str(e), "prompt": sample["prompt"]}
+            return {"error": str(e), "prompt": sample["prompt"], "idx": sample["idx"]}
 
-    with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
-        futures = {
-            executor.submit(process_one, i, s): i
-            for i, s in enumerate(samples)
-        }
-        for i, future in enumerate(as_completed(futures)):
-            result = future.result()
-            if "error" in result:
-                failed += 1
-                if failed <= 3:
-                    print(f"  [WARN] Sample failed: {result['error'][:100]}")
-            else:
-                results.append(result)
+    # Process in batches to avoid submitting all 17K futures at once
+    batch_sz = args.batch_size * 4  # submit 4x batch_size at a time
+    for batch_start in range(0, len(remaining), batch_sz):
+        batch = remaining[batch_start : batch_start + batch_sz]
 
-            if (i + 1) % 100 == 0 or (i + 1) == len(samples):
-                n_easy = sum(1 for r in results if r["avg_reward"] > args.threshold)
-                print(f"  [{i+1}/{len(samples)}] scored={len(results)} "
-                      f"easy(>{args.threshold})={n_easy} failed={failed}")
+        with ThreadPoolExecutor(max_workers=args.batch_size) as executor:
+            future_to_idx = {
+                executor.submit(process_one, i + batch_start, s): s["idx"]
+                for i, s in enumerate(batch)
+            }
+
+            for future in as_completed(future_to_idx, timeout=None):
+                sample_idx = future_to_idx[future]
+                try:
+                    result = future.result(timeout=REQUEST_TIMEOUT_S)
+                except TimeoutError:
+                    timed_out += 1
+                    result = {"error": "future timeout", "idx": sample_idx}
+                except Exception as e:
+                    result = {"error": str(e), "idx": sample_idx}
+
+                if "error" in result and "prompt" not in result:
+                    failed += 1
+                elif "error" in result:
+                    failed += 1
+                    if failed <= 5:
+                        print(f"  [WARN] Sample {result.get('idx','?')} failed: "
+                              f"{result['error'][:80]}")
+                else:
+                    results.append(result)
+
+                total_done += 1
+                if total_done % 100 == 0 or total_done == len(samples):
+                    n_easy = sum(1 for r in results if r["avg_reward"] > args.threshold)
+                    print(f"  [{total_done}/{len(samples)}] scored={len(results)} "
+                          f"easy(>{args.threshold})={n_easy} "
+                          f"failed={failed} timeout={timed_out}")
+
+                # Incremental checkpoint
+                if len(results) % CHECKPOINT_INTERVAL == 0 and len(results) > 0:
+                    _save_checkpoint(progress_path, results)
+                    print(f"  [checkpoint] saved {len(results)} results")
 
     # Stats
     print(f"\n{'='*60}")
@@ -296,6 +347,19 @@ def run_search_temperature(args):
         print(f"  Avg reward: {avg_reward:.4f}")
         print(f"  Distinct 4-gram: {d4:.4f}")
         print(f"  Total tokens: {len(all_tokens)}")
+
+
+def _save_checkpoint(path: Path, results: list[dict]):
+    """Save incremental progress to JSON."""
+    # Strip large fields to keep checkpoint small
+    slim = [
+        {"idx": r["idx"], "avg_reward": r["avg_reward"],
+         "n_correct": r["n_correct"], "n_total": r["n_total"]}
+        for r in results
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"results": slim, "count": len(slim)}, f)
 
 
 def _distinct_n_gram(tokens: list[str], n: int) -> float:
