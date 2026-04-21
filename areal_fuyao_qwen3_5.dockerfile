@@ -23,7 +23,13 @@ RUN pip install --no-deps --target /tmp/megatron-scratch \
  && cp -r /tmp/megatron-scratch/. /AReaL/.venv/lib/python3.12/site-packages/ \
  && rm -rf /tmp/megatron-scratch
 
-# 4. flash-linear-attention for Qwen3.5 GDN layers
+# 4. vLLM 0.17.0 (veRL uses this for Qwen3.5 inference, not SGLang)
+#    Install WITH deps (vllm has many: msgspec, outlines_core, etc.)
+#    Pin torch to prevent upgrade.
+RUN pip install --target /AReaL/.venv/lib/python3.12/site-packages \
+    vllm==0.17.0 "torch==2.9.1"
+
+# 5. flash-linear-attention for Qwen3.5 GDN layers
 RUN pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
     flash-linear-attention==0.4.2
 
