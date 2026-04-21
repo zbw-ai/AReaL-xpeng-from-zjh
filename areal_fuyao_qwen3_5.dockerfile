@@ -3,8 +3,10 @@
 FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:zhangjh37-260325-0644
 ENV MAX_JOBS=1
 
-# transformers: specific commit that handles Qwen3.5 VLM properly
-RUN pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
+# transformers: MUST delete old version first, then install specific commit.
+# --target doesn't remove old .dist-info, so Python may still load 4.57.1.
+RUN rm -rf /AReaL/.venv/lib/python3.12/site-packages/transformers* && \
+    pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
     "transformers @ git+https://github.com/huggingface/transformers.git@d64a6d67d8c004a25570db4df5689e06caea6af7"
 
 # mbridge for Megatron Qwen3.5 support
