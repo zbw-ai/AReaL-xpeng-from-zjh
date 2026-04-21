@@ -104,12 +104,11 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# Qwen3.5 VLM SGLang compatibility:
-# 1. Downgrade transformers to 4.57.1 (5.x returns dict text_config)
-# 2. Patch SGLang assertion (4.57.1 doesn't register qwen3_5_moe, text_config lacks num_attention_heads)
+# Qwen3.5 VLM: pin transformers to a commit that properly handles config
+# (registers qwen3_5_moe AND returns proper PretrainedConfig, not dict)
 pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
-    transformers==4.57.1 2>&1 | tail -1 || echo "[qwen3.5-deps] transformers downgrade failed"
-python3 "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
+    "transformers @ git+https://github.com/huggingface/transformers.git@d64a6d67d8c004a25570db4df5689e06caea6af7" \
+    2>&1 | tail -3 || echo "[qwen3.5-deps] transformers install failed"
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
