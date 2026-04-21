@@ -104,11 +104,12 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# transformers 5.x returns text_config as dict for Qwen3.5 VLM, breaking SGLang.
-# Downgrade to 4.57.1 which returns proper PretrainedConfig objects.
-# Megatron training uses mbridge (independent of transformers version).
+# Qwen3.5 VLM SGLang compatibility:
+# 1. Downgrade transformers to 4.57.1 (5.x returns dict text_config)
+# 2. Patch SGLang assertion (4.57.1 doesn't register qwen3_5_moe, text_config lacks num_attention_heads)
 pip install --no-deps --target /AReaL/.venv/lib/python3.12/site-packages \
     transformers==4.57.1 2>&1 | tail -1 || echo "[qwen3.5-deps] transformers downgrade failed"
+python3 "${SCRIPT_DIR}/patch_sglang_qwen3_5.py"
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
