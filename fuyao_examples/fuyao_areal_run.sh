@@ -104,9 +104,8 @@ else
     echo "[qwen3.5-deps] Use docker image areal-qwen3_5-megatron-v1 or upgrade: uv pip install --upgrade transformers tokenizers"
 fi
 
-# Qwen3.5 VLM: patch SGLang if text_config assertion exists (dict/missing attrs).
-# transformers version is baked into the Docker image — do NOT change at runtime.
-python3 "${SCRIPT_DIR}/patch_sglang_qwen3_5.py" 2>/dev/null || true
+# Qwen3.5 VLM: all deps baked into Docker image (veRL-aligned).
+# No runtime patching needed.
 
 # ========================== 4. 清理残留进程 ==========================
 echo "===== Step 1: Clean up tracked residual processes ====="
