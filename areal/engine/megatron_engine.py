@@ -50,7 +50,10 @@ from areal.engine.core import (
 from areal.engine.core.distributed import init_custom_process_group
 from areal.engine.core.model import disable_dropout_in_model
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
-from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
+from areal.engine.megatron_utils.deterministic import (
+    disable_qwen3_5_incompatible_fusions,
+    set_deterministic_algorithms,
+)
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
 from areal.engine.megatron_utils.megatron import (
     all_gather_param,
@@ -272,6 +275,13 @@ class MegatronEngine(TrainEngine):
             self._check_and_apply_fp8_config()
             self._validate_fp8_consistency()
 
+            # Disable Qwen3.5-incompatible fusions BEFORE model build so that
+            # fusion flags baked at module __init__ (e.g. gradient_accumulation_fusion
+            # in ColumnParallelLinear) take effect. Also disabled again after build
+            # for flags read at forward time.
+            if self.config.pad_to_maximum:
+                disable_qwen3_5_incompatible_fusions(self.tf_config)
+
             # initialize mcore (DDP Wrapped) GPTModel
             with self.device:
                 models = make_mcore_model(
@@ -329,6 +339,11 @@ class MegatronEngine(TrainEngine):
         # NOTE: It is recommended to set this option to True for RL training on MoE models for stability.
         if self.mcore_config.use_deterministic_algorithms:
             set_deterministic_algorithms(model_config)
+        # pad_to_maximum=True is our Qwen3.5 indicator; disable fusion kernels
+        # that are incompatible with mbridge's gated attention (see veRL's
+        # qwen3_5 preset for reference).
+        if self.config.pad_to_maximum:
+            disable_qwen3_5_incompatible_fusions(model_config)
 
         # Set vp_stage for DDP models
         for i, model_chunk in enumerate(self.model):
@@ -621,9 +636,18 @@ class MegatronEngine(TrainEngine):
                 mb_input.padded_mb["position_ids"] = orig_pos_ids
 
             # pad_to_maximum (bshd format): postprocess_packed_seqs_context_parallel
-            # uses squeeze(0) which removes the batch dim when n_seqs==1.
-            # Restore it so output shape is always [n_seqs, S, ...].
-            if self.config.pad_to_maximum and output.ndim == mb_input.padded_mb["input_ids"].ndim:
+            # uses squeeze(0) which removes the batch dim when n_seqs==1. Restore
+            # it only at the pipeline last stage (where output is logits-shaped)
+            # so output shape is always [n_seqs, S, V]. Intermediate-stage outputs
+            # pass through without modification.
+            model_vp_stage_for_squeeze = getattr(model, "vp_stage", 0)
+            if (
+                self.config.pad_to_maximum
+                and mpu.is_pipeline_last_stage(
+                    ignore_virtual=False, vp_stage=model_vp_stage_for_squeeze
+                )
+                and output.ndim == 2
+            ):
                 output = output.unsqueeze(0)
 
             # Release tree attention metadata after forward pass
@@ -787,8 +811,18 @@ class MegatronEngine(TrainEngine):
             elif self.config.pad_to_maximum:
                 # pad_to_maximum: outputs are 2D [n_seqs, S] per micro-batch.
                 # reorder_and_pad_outputs assumes 1D packed format — bypass it.
+                # NOTE: aggregate_fn is intentionally ignored here; caller
+                # (_compute_logp) uses torch.cat dim=-1 which would be wrong
+                # for 2D BSHD logprobs — concat along dim 0 (sequence/batch)
+                # is correct for BSHD.
                 all_logprobs = torch.cat(outputs, dim=0)  # [total_seqs, S]
-                res = all_logprobs[mb_list.backward_indices]  # reorder to original order
+                # Convert list[int] backward_indices to tensor for single-call indexing
+                backward_idx = torch.as_tensor(
+                    mb_list.backward_indices,
+                    dtype=torch.long,
+                    device=all_logprobs.device,
+                )
+                res = all_logprobs[backward_idx]  # reorder to original order
             else:
                 res = reorder_and_pad_outputs(
                     outputs, output_seqlens, mb_list, aggregate_fn
@@ -1489,6 +1523,14 @@ class MegatronEngine(TrainEngine):
         if self.config.pad_to_maximum and input_["position_ids"].ndim == 2:
             input_["position_ids"] = (
                 input_["position_ids"].unsqueeze(-1).expand(-1, -1, 3).contiguous()
+            )
+        # packed_context_parallel_forward only runs CP split when cu_seqlens
+        # is not None; pad_to_maximum sets it to None so CP is silently bypassed.
+        # Fail fast rather than produce wrong logits.
+        if self.config.pad_to_maximum and cp_size > 1:
+            raise ValueError(
+                "pad_to_maximum=True is incompatible with context_parallel_size>1; "
+                "CP split logic in packed_context_parallel_forward requires cu_seqlens."
             )
         # Split the input into micro-batches
         # NOTE: Here we use 2*pp_size in forward to align logprob precision

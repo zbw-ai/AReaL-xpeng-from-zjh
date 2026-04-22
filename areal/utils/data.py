@@ -1093,8 +1093,12 @@ def amend_position_ids(data: dict) -> dict:
         torch.arange(0, seqlen, dtype=torch.long, device=attn_mask.device)
         .unsqueeze(0)
         .expand(bs, -1)
+        .contiguous()
     )
-    position_ids.masked_fill(~attn_mask.bool(), 0)
+    # NOTE: masked_fill (non-inplace) result was previously discarded; preserving
+    # it matters for BSHD-format models whose attention layers don't mask padding
+    # positions (e.g. GatedDeltaNet's recurrent scan).
+    position_ids = position_ids.masked_fill(~attn_mask.bool(), 0)
     data["position_ids"] = position_ids
     return data
 
