@@ -3,11 +3,6 @@
 FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:verl-qwen3_5-v9-latest
 ENV MAX_JOBS=1
 
-# AReaL deps missing from veRL image
-# No --target: veRL image may not use /AReaL/.venv/
-RUN pip install \
-    math_verify \
-    uvloop \
-    aiofiles \
-    colorlog \
-    swanlab
+# Only 3 packages AReaL needs that veRL doesn't have
+# (uvloop, colorlog, swanlab, psutil, orjson etc. already in veRL)
+RUN pip install aiofiles tensorboardX math_verify
