@@ -167,7 +167,7 @@ def run_filter(args):
     - Incremental checkpoint saves progress every CHECKPOINT_INTERVAL samples
     - Resumes from checkpoint if output.progress.json exists
     """
-    REQUEST_TIMEOUT_S = 300  # per-request hard timeout (kill stuck futures)
+    REQUEST_TIMEOUT_S = 180  # per-request hard timeout (kill stuck futures)
     CHECKPOINT_INTERVAL = 500  # save progress every N completions
 
     print(f"Loading dataset from {args.dataset_path} (type={args.dataset_type})")
