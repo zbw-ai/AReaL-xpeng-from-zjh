@@ -94,7 +94,9 @@ class RLVRWorkflow(RolloutWorkflow):
         float
             Reward value.
         """
-        completions_str = self.tokenizer.decode(resp.output_tokens)
+        # Ensure token IDs are int (tokenizers>=0.22 rejects str IDs)
+        output_ids = [int(t) for t in resp.output_tokens] if resp.output_tokens and isinstance(resp.output_tokens[0], str) else resp.output_tokens
+        completions_str = self.tokenizer.decode(output_ids)
         reward = await self.async_reward_fn(
             prompt_str,
             completions_str,
@@ -153,7 +155,8 @@ class RLVRWorkflow(RolloutWorkflow):
             tokenizer=self.tokenizer,
         )
 
-        prompt_str = self.tokenizer.decode(input_ids)
+        _input_ids = [int(t) for t in input_ids] if input_ids and isinstance(input_ids[0], str) else input_ids
+        prompt_str = self.tokenizer.decode(_input_ids)
 
         # Generate single response and compute reward
         resp, reward = await self._collect_samples(engine, req, prompt_str, data)
