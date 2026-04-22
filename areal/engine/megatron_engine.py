@@ -1459,7 +1459,13 @@ class MegatronEngine(TrainEngine):
             mb_spec,
             group=mpu.get_data_parallel_group(),
         )
-        mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
+        # When pad_to_maximum is True (e.g. Qwen3.5 GDN needs bshd format),
+        # skip pack_tensor_dict: keep attention_mask in the batch and let mbridge
+        # handle THD/bshd conversion internally via its own preprocess_packed_seqs.
+        # Otherwise AReaL removes attention_mask (replaces with cu_seqlens),
+        # but mbridge's forward expects attention_mask to be present.
+        if not self.config.pad_to_maximum:
+            mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
         # NOTE: Pad micro-batches to:
         # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
         #  of GPU page size or max_tokens_per_mb
