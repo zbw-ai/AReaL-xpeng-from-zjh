@@ -624,6 +624,12 @@ class MegatronEngine(TrainEngine):
                     cu_seqlens=cu_seqlens,
                     old_cu_seqlens=mb_input.old_cu_seqlens,
                 )
+                # pad_to_maximum: padded_mb was aligned to tp_size along seq dim.
+                # Trim output back to orig_mb's seq dim so shapes match labels.
+                if self.config.pad_to_maximum:
+                    orig_s = mb_input.orig_mb["input_ids"].shape[1]
+                    if output.shape[1] > orig_s:
+                        output = output[:, :orig_s]
             return output, functools.partial(_process_output, mb_input.orig_mb)
 
         forward_backward_func = get_forward_backward_func()
@@ -1476,19 +1482,53 @@ class MegatronEngine(TrainEngine):
             group=mpu.get_data_parallel_group(),
         )
         if self.config.pad_to_maximum:
-            # Qwen3.5 GDN (bshd format): skip pack + pad entirely.
-            # Data stays as [B, max_seq_len] with attention_mask preserved.
-            # mbridge handles THD/bshd conversion internally via preprocess_packed_seqs.
-            mb_list.padded_mbs = mb_list.mbs
-            mb_list.padding_lengths = [0] * len(mb_list.mbs)
-            mb_list.padded_to_lengths = mb_list.group_lens
+            # Qwen3.5 GDN (bshd format): skip packing to preserve attention_mask.
+            # Data stays as [B, S] but we MUST still align the sequence dim so
+            # Megatron's TP sequence parallelism can split along it.
+            align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+
+            def _pad_seq_dim(mb_dict: dict) -> tuple[dict, int]:
+                cur_s = mb_dict["attention_mask"].shape[1]
+                padded_s = (
+                    (cur_s + align_to_multiple_of - 1) // align_to_multiple_of
+                ) * align_to_multiple_of
+                pad_len = padded_s - cur_s
+                if pad_len == 0:
+                    return mb_dict, 0
+                new_mb = {}
+                for key, value in mb_dict.items():
+                    if (
+                        torch.is_tensor(value)
+                        and value.ndim >= 2
+                        and value.shape[1] == cur_s
+                    ):
+                        # Pad dim 1 (seq dim) with 0 on the right.
+                        # F.pad tuple is (last_dim_left, last_dim_right, ...)
+                        pad_spec = [0] * (2 * value.ndim)
+                        # dim 1 corresponds to the second-to-last pair if ndim==2,
+                        # third-to-last pair if ndim==3, etc.
+                        idx = 2 * (value.ndim - 1 - 1) + 1
+                        pad_spec[idx] = pad_len
+                        new_mb[key] = torch.nn.functional.pad(
+                            value, tuple(pad_spec), value=0
+                        )
+                    else:
+                        new_mb[key] = value
+                return new_mb, pad_len
+
+            padded_mbs_and_lens = [_pad_seq_dim(mb) for mb in mb_list.mbs]
+            mb_list.padded_mbs = [p[0] for p in padded_mbs_and_lens]
+            # padding_lengths=0 because unpad_logits trims along dim 0 (packed
+            # format). In bshd format we pad along seq dim (dim 1) and rely on
+            # split_batch → _unpad_splits(traj_seqlens) to trim downstream.
+            mb_list.padding_lengths = [0] * len(padded_mbs_and_lens)
+            mb_list.padded_to_lengths = [
+                p[0]["attention_mask"].shape[1] for p in padded_mbs_and_lens
+            ]
             mb_list.old_cu_seqlens_list = None  # not a list-of-None; MicroBatchList.to() iterates this
-            mb_list.align_to_lengths = mb_list.group_lens
+            mb_list.align_to_lengths = mb_list.padded_to_lengths
             # Pre-set _max_seqlen so the property doesn't assert cu_seqlens existence.
-            # Compute total tokens per micro-batch from attention_mask.
-            mb_list._max_seqlen = max(
-                int(mb["attention_mask"].sum().item()) for mb in mb_list.mbs
-            )
+            mb_list._max_seqlen = max(mb_list.padded_to_lengths)
         else:
             mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
             # NOTE: Pad micro-batches to:
