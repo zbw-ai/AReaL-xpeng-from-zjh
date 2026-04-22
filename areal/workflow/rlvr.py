@@ -1,5 +1,5 @@
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -37,7 +37,8 @@ def default_get_input_ids_fn(
         enable_thinking=enable_thinking,
     )
     # VLM tokenizers (Qwen3.5) may return dict/BatchEncoding {'input_ids': [...], ...}
-    if isinstance(result, dict):
+    # BatchEncoding inherits UserDict (not dict), so check Mapping instead.
+    if isinstance(result, Mapping):
         result = result["input_ids"]
     # Flatten nested lists (some tokenizers return [[id, id, ...]])
     if result and isinstance(result, list) and isinstance(result[0], list):
@@ -167,8 +168,8 @@ class RLVRWorkflow(RolloutWorkflow):
             self.tokenizer,
             self.enable_thinking,
         )
-        # Defensive: extract list from dict if custom get_input_ids_fn returns one
-        if isinstance(input_ids, dict):
+        # Defensive: extract list from dict/BatchEncoding if custom get_input_ids_fn returns one
+        if isinstance(input_ids, Mapping):
             input_ids = input_ids["input_ids"]
         # Guard: if get_input_ids_fn returned a string (not a list), re-encode it
         if isinstance(input_ids, str):
