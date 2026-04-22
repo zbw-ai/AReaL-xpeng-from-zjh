@@ -36,10 +36,28 @@ def default_get_input_ids_fn(
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
     )
-    # VLM tokenizers (Qwen3.5) may return dict {'input_ids': [...], ...}
+    # VLM tokenizers (Qwen3.5) may return dict/BatchEncoding {'input_ids': [...], ...}
     if isinstance(result, dict):
-        return list(result["input_ids"])
-    return list(result)
+        result = result["input_ids"]
+    # Flatten nested lists (some tokenizers return [[id, id, ...]])
+    if result and isinstance(result, list) and isinstance(result[0], list):
+        result = result[0]
+    # VLM tokenizers may silently fall back to tokenize=False (returning a string)
+    # when the chat template doesn't support extra kwargs like enable_thinking.
+    # list(string) produces ['c','h','a','r',...] — detect and re-encode.
+    if isinstance(result, str) or (
+        isinstance(result, list) and result and isinstance(result[0], str)
+    ):
+        # apply_chat_template returned a formatted string (or list("string") produced
+        # character-level strings). Re-encode via tokenizer.encode().
+        text = result if isinstance(result, str) else "".join(result)
+        logger.warning(
+            "apply_chat_template(tokenize=True) returned strings instead of "
+            "token IDs (common with VLM tokenizers). Falling back to "
+            "tokenize=False + tokenizer.encode()."
+        )
+        return tokenizer.encode(text, add_special_tokens=False)
+    return [int(x) for x in result]
 
 
 def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
@@ -149,9 +167,28 @@ class RLVRWorkflow(RolloutWorkflow):
             self.tokenizer,
             self.enable_thinking,
         )
-        # get_input_ids_fn may return dict {'input_ids': [...], ...} — extract list
+        # Defensive: extract list from dict if custom get_input_ids_fn returns one
         if isinstance(input_ids, dict):
             input_ids = input_ids["input_ids"]
+        # Guard: if get_input_ids_fn returned a string (not a list), re-encode it
+        if isinstance(input_ids, str):
+            logger.warning(
+                "get_input_ids_fn returned a string instead of list[int]. "
+                "Re-encoding with tokenizer.encode()."
+            )
+            input_ids = self.tokenizer.encode(input_ids, add_special_tokens=False)
+        # Ensure all elements are ints (handles numpy ints, torch ints, etc.)
+        if input_ids and not isinstance(input_ids[0], int):
+            if isinstance(input_ids[0], str):
+                # list of char strings from list("some text") — re-encode
+                text = "".join(input_ids)
+                logger.warning(
+                    "get_input_ids_fn returned list of strings instead of list[int]. "
+                    "Re-encoding with tokenizer.encode()."
+                )
+                input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            else:
+                input_ids = [int(x) for x in input_ids]
         req = ModelRequest(
             rid=uuid.uuid4().hex,
             input_ids=input_ids,
