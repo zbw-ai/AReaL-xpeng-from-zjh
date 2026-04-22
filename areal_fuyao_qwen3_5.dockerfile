@@ -4,7 +4,8 @@ FROM infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:verl-qwen
 ENV MAX_JOBS=1
 
 # AReaL deps missing from veRL image
-RUN pip install --target /AReaL/.venv/lib/python3.12/site-packages \
+# No --target: veRL image may not use /AReaL/.venv/
+RUN pip install \
     math_verify \
     uvloop \
     aiofiles \
