@@ -596,7 +596,29 @@ class MegatronEngine(TrainEngine):
                     mb_input.padded_mb.update(tree_kwargs)
                     tree_attn_keys = list(tree_kwargs.keys())
 
+            # Qwen3.5 VL multimodal rotary expects position_ids in shape
+            # [3, B, S] (MRoPE axes first). Our data pipeline keeps [B, S, 3]
+            # so dim 0 stays = batch for split/pad. Transpose just before
+            # model forward; restore afterwards so downstream code (which
+            # reads from padded_mb) stays consistent with [B, S, 3].
+            orig_pos_ids = None
+            if (
+                self.config.pad_to_maximum
+                and "position_ids" in mb_input.padded_mb
+                and mb_input.padded_mb["position_ids"].ndim == 3
+            ):
+                orig_pos_ids = mb_input.padded_mb["position_ids"]
+                # [B, S, 3] -> [3, B, S]
+                mb_input.padded_mb["position_ids"] = orig_pos_ids.permute(
+                    2, 0, 1
+                ).contiguous()
+
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
+
+            # Restore [B, S, 3] layout after forward so any downstream reader
+            # sees the original shape (e.g., orig_mb accessors).
+            if orig_pos_ids is not None:
+                mb_input.padded_mb["position_ids"] = orig_pos_ids
 
             # pad_to_maximum (bshd format): postprocess_packed_seqs_context_parallel
             # uses squeeze(0) which removes the batch dim when n_seqs==1.
