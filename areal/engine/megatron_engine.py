@@ -1460,6 +1460,14 @@ class MegatronEngine(TrainEngine):
             return mb_list
         # Amend position ids
         input_ = amend_position_ids(input_)
+        # Qwen3.5 VL multimodal rotary (MRoPE) expects position_ids of shape
+        # [B, S, 3] (text + vision-h + vision-w axes). For text-only inputs
+        # all three axes are identical. pad_to_maximum=True is currently set
+        # only for Qwen3.5-family models, so use it as the trigger.
+        if self.config.pad_to_maximum and input_["position_ids"].ndim == 2:
+            input_["position_ids"] = (
+                input_["position_ids"].unsqueeze(-1).expand(-1, -1, 3).contiguous()
+            )
         # Split the input into micro-batches
         # NOTE: Here we use 2*pp_size in forward to align logprob precision
         # TODO: Performance check
