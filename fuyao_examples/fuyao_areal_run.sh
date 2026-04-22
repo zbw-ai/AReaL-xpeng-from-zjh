@@ -151,6 +151,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1  # Qwen3.5 VLM: derived 2048 < actual
 export SGLANG_DISABLE_CUDNN_CHECK=1                  # PyTorch 2.9.1 + CuDNN 9.10 (Conv3d bug, not relevant for LLM)
 
+# Disable torch.compile / torch._dynamo. Megatron's _apply_output_gate
+# (called by mbridge qwen3_5 gated attention) is @torch.compile-wrapped
+# and its view call fails during Dynamo tracing because mbridge passes
+# gate and x with different element counts. Disabling compile forces
+# eager execution where the view still fails the same way... BUT if the
+# real root is Dynamo's fake-tensor shape inference misreading the tensor
+# meta, eager avoids it. This is what veRL's qwen3_5 runs (no compile).
+export TORCHDYNAMO_DISABLE=1
+export TORCH_COMPILE_DISABLE=1
+
 # Python 配置
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1

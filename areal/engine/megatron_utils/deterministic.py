@@ -18,11 +18,26 @@ def disable_qwen3_5_incompatible_fusions(model_config):
     "Some models (e.g. qwen3.5 with mbridge) are incompatible with
     apply_rope_fusion."
     """
+    before = {
+        "apply_rope_fusion": getattr(model_config, "apply_rope_fusion", None),
+        "masked_softmax_fusion": getattr(model_config, "masked_softmax_fusion", None),
+        "bias_activation_fusion": getattr(model_config, "bias_activation_fusion", None),
+        "bias_dropout_fusion": getattr(model_config, "bias_dropout_fusion", None),
+        "gradient_accumulation_fusion": getattr(
+            model_config, "gradient_accumulation_fusion", None
+        ),
+    }
     model_config.apply_rope_fusion = False
     model_config.masked_softmax_fusion = False
     model_config.bias_activation_fusion = False
     model_config.bias_dropout_fusion = False
     model_config.gradient_accumulation_fusion = False
+    # Print to stderr so it's visible regardless of logger configuration.
+    print(
+        f"[disable_qwen3_5_incompatible_fusions] was={before}, "
+        f"all now False (for Qwen3.5 compat; matches veRL qwen3_5 preset).",
+        flush=True,
+    )
     logger.info(
         "Disabled Megatron fusions (apply_rope_fusion, masked_softmax_fusion, "
         "bias_activation_fusion, bias_dropout_fusion, gradient_accumulation_fusion) "
