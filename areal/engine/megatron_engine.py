@@ -1498,10 +1498,14 @@ class MegatronEngine(TrainEngine):
             mb_list.mbs[i] = dict(**mb)
         for i, mb in enumerate(mb_list.padded_mbs):
             mb_list.padded_mbs[i] = dict(**mb)
-        for mb in mb_list.mbs:
-            mb["max_seqlen"] = int(mb["max_seqlen"])
-        for mb in mb_list.padded_mbs:
-            mb["max_seqlen"] = int(mb["max_seqlen"])
+        if not self.config.pad_to_maximum:
+            # max_seqlen is created by pack_tensor_dict; when pad_to_maximum=True
+            # we skip packing so max_seqlen doesn't exist — mbridge derives it
+            # from attention_mask internally.
+            for mb in mb_list.mbs:
+                mb["max_seqlen"] = int(mb["max_seqlen"])
+            for mb in mb_list.padded_mbs:
+                mb["max_seqlen"] = int(mb["max_seqlen"])
         return mb_list
 
     def _compute_logprobs_and_loss(
