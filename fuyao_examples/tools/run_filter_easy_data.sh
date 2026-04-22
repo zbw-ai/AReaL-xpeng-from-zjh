@@ -38,7 +38,7 @@ OUTPUT_FILE="${OUTPUT_DIR}/dapo_math_stage2_filtered.parquet"
 # 过滤参数
 N_SAMPLES="${N_SAMPLES:-8}"           # 每个 prompt 生成几个 response (与训练一致)
 TEMPERATURE="${TEMPERATURE:-1.4}"     # 采样温度
-MAX_TOKENS="${MAX_TOKENS:-4096}"      # 最大生成长度 (训练 avg=3.4K, 4K 足够判断难度)
+MAX_TOKENS="${MAX_TOKENS:-8192}"      # 最大生成长度 (训练 avg=3.4K, 超时的跳过)
 THRESHOLD="${THRESHOLD:-0.9}"         # avg_reward > 此值的题被 drop
 BATCH_SIZE="${BATCH_SIZE:-32}"        # 并发请求数
 
@@ -83,7 +83,7 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
         --dtype bfloat16 \
         --mem-fraction-static 0.85 \
         --disable-custom-all-reduce \
-        --context-length 5120 \
+        --context-length 9216 \
         &
     SGLANG_PIDS+=($!)
     SGLANG_URLS+=("http://localhost:${PORT}")

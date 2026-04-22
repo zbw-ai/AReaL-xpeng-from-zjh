@@ -217,8 +217,10 @@ def run_filter(args):
         except Exception as e:
             return {"error": str(e), "prompt": sample["prompt"], "idx": sample["idx"]}
 
-    # Process in batches to avoid submitting all 17K futures at once
-    batch_sz = args.batch_size * 4  # submit 4x batch_size at a time
+    # Process in batches — each batch has a hard wall-clock deadline
+    batch_sz = args.batch_size * 2  # submit 2x batch_size at a time
+    BATCH_DEADLINE_S = REQUEST_TIMEOUT_S * 3  # max time for entire batch
+
     for batch_start in range(0, len(remaining), batch_sz):
         batch = remaining[batch_start : batch_start + batch_sz]
 
@@ -228,37 +230,49 @@ def run_filter(args):
                 for i, s in enumerate(batch)
             }
 
-            for future in as_completed(future_to_idx, timeout=None):
-                sample_idx = future_to_idx[future]
-                try:
-                    result = future.result(timeout=REQUEST_TIMEOUT_S)
-                except TimeoutError:
-                    timed_out += 1
-                    result = {"error": "future timeout", "idx": sample_idx}
-                except Exception as e:
-                    result = {"error": str(e), "idx": sample_idx}
+            # Use as_completed with batch-level timeout
+            try:
+                for future in as_completed(future_to_idx, timeout=BATCH_DEADLINE_S):
+                    sample_idx = future_to_idx[future]
+                    try:
+                        result = future.result(timeout=10)  # already done, just collect
+                    except Exception as e:
+                        result = {"error": str(e), "idx": sample_idx}
 
-                if "error" in result and "prompt" not in result:
-                    failed += 1
-                elif "error" in result:
-                    failed += 1
-                    if failed <= 5:
-                        print(f"  [WARN] Sample {result.get('idx','?')} failed: "
-                              f"{result['error'][:80]}")
-                else:
-                    results.append(result)
+                    if "error" in result:
+                        failed += 1
+                        if failed <= 10:
+                            err_msg = result.get("error", "unknown")[:80]
+                            print(f"  [WARN] Sample {result.get('idx','?')} failed: {err_msg}")
+                    else:
+                        results.append(result)
 
-                total_done += 1
-                if total_done % 100 == 0 or total_done == len(samples):
-                    n_easy = sum(1 for r in results if r["avg_reward"] > args.threshold)
-                    print(f"  [{total_done}/{len(samples)}] scored={len(results)} "
-                          f"easy(>{args.threshold})={n_easy} "
-                          f"failed={failed} timeout={timed_out}")
+                    total_done += 1
+                    if total_done % 100 == 0 or total_done == len(samples):
+                        n_easy = sum(1 for r in results if r["avg_reward"] > args.threshold)
+                        print(f"  [{total_done}/{len(samples)}] scored={len(results)} "
+                              f"easy(>{args.threshold})={n_easy} "
+                              f"failed={failed} timeout={timed_out}")
 
-                # Incremental checkpoint
-                if len(results) % CHECKPOINT_INTERVAL == 0 and len(results) > 0:
-                    _save_checkpoint(progress_path, results)
-                    print(f"  [checkpoint] saved {len(results)} results")
+                    # Incremental checkpoint
+                    if len(results) % CHECKPOINT_INTERVAL == 0 and len(results) > 0:
+                        _save_checkpoint(progress_path, results)
+                        print(f"  [checkpoint] saved {len(results)} results")
+
+            except TimeoutError:
+                # Batch deadline hit — cancel remaining futures, count as timeout
+                n_pending = sum(1 for f in future_to_idx if not f.done())
+                timed_out += n_pending
+                total_done += n_pending
+                for f in future_to_idx:
+                    f.cancel()
+                print(f"  [TIMEOUT] Batch deadline ({BATCH_DEADLINE_S}s) hit, "
+                      f"skipped {n_pending} stuck requests. "
+                      f"Total timeout={timed_out}")
+
+        # Checkpoint after each batch
+        if results:
+            _save_checkpoint(progress_path, results)
 
     # Stats
     print(f"\n{'='*60}")
