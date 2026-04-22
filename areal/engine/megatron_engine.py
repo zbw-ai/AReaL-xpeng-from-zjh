@@ -721,9 +721,14 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
 
         # Step 1: Prepare sequence lengths
-        cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
-        if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+        if self.config.pad_to_maximum:
+            # pad_to_maximum keeps attention_mask [B, S]; derive seqlens directly.
+            if output_seqlens is None:
+                output_seqlens = input_["attention_mask"].sum(dim=1).cpu().numpy().tolist()
+        else:
+            cu_seqlens = pack_tensor_dict(input_)["cu_seqlens"]
+            if output_seqlens is None:
+                output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
@@ -1466,8 +1471,13 @@ class MegatronEngine(TrainEngine):
             mb_list.padded_mbs = mb_list.mbs
             mb_list.padding_lengths = [0] * len(mb_list.mbs)
             mb_list.padded_to_lengths = mb_list.group_lens
-            mb_list.old_cu_seqlens_list = [None] * len(mb_list.mbs)
+            mb_list.old_cu_seqlens_list = None  # not a list-of-None; MicroBatchList.to() iterates this
             mb_list.align_to_lengths = mb_list.group_lens
+            # Pre-set _max_seqlen so the property doesn't assert cu_seqlens existence.
+            # Compute total tokens per micro-batch from attention_mask.
+            mb_list._max_seqlen = max(
+                int(mb["attention_mask"].sum().item()) for mb in mb_list.mbs
+            )
         else:
             mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
             # NOTE: Pad micro-batches to:
