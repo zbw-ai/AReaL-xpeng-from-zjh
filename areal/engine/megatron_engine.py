@@ -1459,30 +1459,34 @@ class MegatronEngine(TrainEngine):
             mb_spec,
             group=mpu.get_data_parallel_group(),
         )
-        # When pad_to_maximum is True (e.g. Qwen3.5 GDN needs bshd format),
-        # skip pack_tensor_dict: keep attention_mask in the batch and let mbridge
-        # handle THD/bshd conversion internally via its own preprocess_packed_seqs.
-        # Otherwise AReaL removes attention_mask (replaces with cu_seqlens),
-        # but mbridge's forward expects attention_mask to be present.
-        if not self.config.pad_to_maximum:
+        if self.config.pad_to_maximum:
+            # Qwen3.5 GDN (bshd format): skip pack + pad entirely.
+            # Data stays as [B, max_seq_len] with attention_mask preserved.
+            # mbridge handles THD/bshd conversion internally via preprocess_packed_seqs.
+            mb_list.padded_mbs = mb_list.mbs
+            mb_list.padding_lengths = [0] * len(mb_list.mbs)
+            mb_list.padded_to_lengths = mb_list.group_lens
+            mb_list.old_cu_seqlens_list = [None] * len(mb_list.mbs)
+            mb_list.align_to_lengths = mb_list.group_lens
+        else:
             mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
-        # NOTE: Pad micro-batches to:
-        # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
-        #  of GPU page size or max_tokens_per_mb
-        # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
-        #    to satisfy the requirement of Megatron parallelism.
-        align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
-        align_to_multiple_of = (
-            math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
-            if self.enable_fp8
-            else align_to_multiple_of
-        )
-        mb_list = pad_mb_list(
-            mb_list,
-            pad_value=0.0,
-            pad_to_maximum=self.config.pad_to_maximum,
-            seq_align_to=align_to_multiple_of,
-        )
+            # NOTE: Pad micro-batches to:
+            # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
+            #  of GPU page size or max_tokens_per_mb
+            # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
+            #    to satisfy the requirement of Megatron parallelism.
+            align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+            align_to_multiple_of = (
+                math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
+                if self.enable_fp8
+                else align_to_multiple_of
+            )
+            mb_list = pad_mb_list(
+                mb_list,
+                pad_value=0.0,
+                pad_to_maximum=self.config.pad_to_maximum,
+                seq_align_to=align_to_multiple_of,
+            )
         self.logger.info(
             f"#microbatch: {len(mb_list.group_lens)}, microbatch #tokens: {mb_list.group_lens}, "
             f"aligned to: {mb_list.align_to_lengths}, padded to: {mb_list.padded_to_lengths}, "
