@@ -120,22 +120,29 @@ def load_dataset_samples(path: str, dataset_type: str):
 
 
 def generate_one(server_url: str, prompt: str, n: int, temperature: float, max_tokens: int):
-    """Generate N completions for one prompt via OpenAI-compatible API."""
-    resp = requests.post(
-        f"{server_url}/v1/chat/completions",
-        json={
-            "model": "default",
-            "messages": [{"role": "user", "content": prompt}],
-            "n": n,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": 1.0,
-        },
-        timeout=600,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return [c["message"]["content"] for c in data["choices"]]
+    """Generate N completions for one prompt via OpenAI-compatible API.
+
+    Uses n=1 per request instead of n=N to avoid SGLang hanging on large
+    batch-in-single-request. Sends N individual requests sequentially.
+    """
+    completions = []
+    for _ in range(n):
+        resp = requests.post(
+            f"{server_url}/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [{"role": "user", "content": prompt}],
+                "n": 1,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "top_p": 1.0,
+            },
+            timeout=(10, 180),  # (connect_timeout, read_timeout)
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        completions.append(data["choices"][0]["message"]["content"])
+    return completions
 
 
 def score_sample(prompt: str, completions: list[str], answer: str) -> dict:

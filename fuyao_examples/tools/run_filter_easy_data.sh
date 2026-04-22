@@ -40,7 +40,7 @@ N_SAMPLES="${N_SAMPLES:-8}"           # 每个 prompt 生成几个 response (与
 TEMPERATURE="${TEMPERATURE:-1.4}"     # 采样温度
 MAX_TOKENS="${MAX_TOKENS:-8192}"      # 最大生成长度 (训练 avg=3.4K, 超时的跳过)
 THRESHOLD="${THRESHOLD:-0.9}"         # avg_reward > 此值的题被 drop
-BATCH_SIZE="${BATCH_SIZE:-32}"        # 并发请求数
+BATCH_SIZE="${BATCH_SIZE:-64}"        # 并发 prompts (each sends n=1 x 8 sequentially)
 
 # SGLang 参数 — 自动检测 GPU 数量，启动尽可能多的 TP4 实例
 TP="${TP:-4}"
