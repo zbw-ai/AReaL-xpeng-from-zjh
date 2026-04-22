@@ -30,35 +30,28 @@ def default_get_input_ids_fn(
     tokenizer: PreTrainedTokenizerFast,
     enable_thinking: bool,
 ) -> list[int]:
-    result = tokenizer.apply_chat_template(
-        data,
-        tokenize=True,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-    )
-    # VLM tokenizers (Qwen3.5) may return dict/BatchEncoding {'input_ids': [...], ...}
-    # BatchEncoding inherits UserDict (not dict), so check Mapping instead.
-    if isinstance(result, Mapping):
-        result = result["input_ids"]
-    # Flatten nested lists (some tokenizers return [[id, id, ...]])
-    if result and isinstance(result, list) and isinstance(result[0], list):
-        result = result[0]
-    # VLM tokenizers may silently fall back to tokenize=False (returning a string)
-    # when the chat template doesn't support extra kwargs like enable_thinking.
-    # list(string) produces ['c','h','a','r',...] — detect and re-encode.
-    if isinstance(result, str) or (
-        isinstance(result, list) and result and isinstance(result[0], str)
-    ):
-        # apply_chat_template returned a formatted string (or list("string") produced
-        # character-level strings). Re-encode via tokenizer.encode().
-        text = result if isinstance(result, str) else "".join(result)
-        logger.warning(
-            "apply_chat_template(tokenize=True) returned strings instead of "
-            "token IDs (common with VLM tokenizers). Falling back to "
-            "tokenize=False + tokenizer.encode()."
+    # Follow veRL's pattern: apply_chat_template(tokenize=False) for text,
+    # then tokenizer.encode() for token IDs. This avoids all return-type
+    # ambiguities (dict, BatchEncoding, string, list-of-strings) from
+    # apply_chat_template(tokenize=True) across different tokenizer versions.
+    kwargs = {}
+    if enable_thinking:
+        kwargs["enable_thinking"] = enable_thinking
+    try:
+        text = tokenizer.apply_chat_template(
+            data,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
         )
-        return tokenizer.encode(text, add_special_tokens=False)
-    return [int(x) for x in result]
+    except TypeError:
+        # Tokenizer doesn't support enable_thinking kwarg — retry without it
+        text = tokenizer.apply_chat_template(
+            data,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    return tokenizer.encode(text, add_special_tokens=False)
 
 
 def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
