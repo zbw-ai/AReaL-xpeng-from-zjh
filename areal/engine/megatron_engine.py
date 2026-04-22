@@ -611,27 +611,21 @@ class MegatronEngine(TrainEngine):
                     mb_input.padded_mb.update(tree_kwargs)
                     tree_attn_keys = list(tree_kwargs.keys())
 
-            # Qwen3.5 VL multimodal rotary expects position_ids in shape
-            # [3, B, S] (MRoPE axes first). Our data pipeline keeps [B, S, 3]
-            # so dim 0 stays = batch for split/pad. Transpose just before
-            # model forward; restore afterwards so downstream code (which
-            # reads from padded_mb) stays consistent with [B, S, 3].
+            # Align with veRL's VL BSHD path (model_forward.py:147-152):
+            # for VL models, pass position_ids=None and let mbridge's
+            # qwen3_vl/model.py compute it via get_rope_index. Our earlier
+            # expand-to-3D + transpose-to-[3,B,S] was unnecessary and may
+            # trigger a different mbridge code branch that causes the
+            # _apply_output_gate shape mismatch.
             orig_pos_ids = None
-            if (
-                self.config.pad_to_maximum
-                and "position_ids" in mb_input.padded_mb
-                and mb_input.padded_mb["position_ids"].ndim == 3
-            ):
+            if self.config.pad_to_maximum and "position_ids" in mb_input.padded_mb:
                 orig_pos_ids = mb_input.padded_mb["position_ids"]
-                # [B, S, 3] -> [3, B, S]
-                mb_input.padded_mb["position_ids"] = orig_pos_ids.permute(
-                    2, 0, 1
-                ).contiguous()
+                mb_input.padded_mb["position_ids"] = None
 
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
 
-            # Restore [B, S, 3] layout after forward so any downstream reader
-            # sees the original shape (e.g., orig_mb accessors).
+            # Restore original position_ids after forward so downstream readers
+            # (if any) see consistent state.
             if orig_pos_ids is not None:
                 mb_input.padded_mb["position_ids"] = orig_pos_ids
 
@@ -1516,14 +1510,11 @@ class MegatronEngine(TrainEngine):
             return mb_list
         # Amend position ids
         input_ = amend_position_ids(input_)
-        # Qwen3.5 VL multimodal rotary (MRoPE) expects position_ids of shape
-        # [B, S, 3] (text + vision-h + vision-w axes). For text-only inputs
-        # all three axes are identical. pad_to_maximum=True is currently set
-        # only for Qwen3.5-family models, so use it as the trigger.
-        if self.config.pad_to_maximum and input_["position_ids"].ndim == 2:
-            input_["position_ids"] = (
-                input_["position_ids"].unsqueeze(-1).expand(-1, -1, 3).contiguous()
-            )
+        # NOTE: for pad_to_maximum (Qwen3.5 VL), forward_step overrides
+        # position_ids to None so mbridge computes MRoPE internally via
+        # get_rope_index (matches veRL's VL BSHD path). We keep the 2D
+        # [B, S] position_ids in the data pipeline for bookkeeping only;
+        # it is not consumed by the model forward.
         # packed_context_parallel_forward only runs CP split when cu_seqlens
         # is not None; pad_to_maximum sets it to None so CP is silently bypassed.
         # Fail fast rather than produce wrong logits.
