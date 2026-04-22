@@ -598,6 +598,12 @@ class MegatronEngine(TrainEngine):
 
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
 
+            # pad_to_maximum (bshd format): postprocess_packed_seqs_context_parallel
+            # uses squeeze(0) which removes the batch dim when n_seqs==1.
+            # Restore it so output shape is always [n_seqs, S, ...].
+            if self.config.pad_to_maximum and output.ndim == mb_input.padded_mb["input_ids"].ndim:
+                output = output.unsqueeze(0)
+
             # Release tree attention metadata after forward pass
             for key in tree_attn_keys:
                 del mb_input.padded_mb[key]
@@ -750,6 +756,11 @@ class MegatronEngine(TrainEngine):
         if mpu.is_pipeline_last_stage():
             if self.enable_tree_training:
                 res = merge_packed_tree_results(outputs, batch_size)
+            elif self.config.pad_to_maximum:
+                # pad_to_maximum: outputs are 2D [n_seqs, S] per micro-batch.
+                # reorder_and_pad_outputs assumes 1D packed format — bypass it.
+                all_logprobs = torch.cat(outputs, dim=0)  # [total_seqs, S]
+                res = all_logprobs[mb_list.backward_indices]  # reorder to original order
             else:
                 res = reorder_and_pad_outputs(
                     outputs, output_seqlens, mb_list, aggregate_fn
