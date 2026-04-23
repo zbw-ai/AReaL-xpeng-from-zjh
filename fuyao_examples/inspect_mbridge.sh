@@ -69,6 +69,17 @@ python3 -c "import megatron.core; print('megatron.core.__version__:', getattr(me
 echo ""
 
 echo "================================================================"
+echo " 5aa. mbridge qwen3_5 base_bridge.py — FULL SOURCE (for QKV split logic)"
+echo "================================================================"
+BASE_BRIDGE="${MBRIDGE_QWEN3_5}/base_bridge.py"
+if [[ -f "${BASE_BRIDGE}" ]]; then
+    echo "--- File: ${BASE_BRIDGE}"
+    echo "--- Lines: $(wc -l < ${BASE_BRIDGE})"
+    cat -n "${BASE_BRIDGE}"
+fi
+echo ""
+
+echo "================================================================"
 echo " 5a. mbridge qwen3_5 model.py forward() — find preprocess_packed_seqs callsites"
 echo "================================================================"
 MODEL_FILE="${MBRIDGE_QWEN3_5}/model.py"
