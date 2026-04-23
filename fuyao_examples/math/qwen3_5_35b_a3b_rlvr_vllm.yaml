@@ -43,7 +43,9 @@ experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-math-rlvr
 trial_name: trial0
 
 seed: 42
-enable_offload: false
+enable_offload: true  # MANDATORY for 35B colocated actor+ref: offloads idle engine
+                      # params/optimizer to CPU to avoid ~48GB GPU overlap
+                      # (mirror of veRL's param_offload+optimizer_offload+grad_offload)
 total_train_epochs: 10
 tokenizer_path: ${actor.path}
 
@@ -104,7 +106,7 @@ actor:
   mb_spec:
     n_mbs: 1
     granularity: 1
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 4096   # lowered from 10240 to bound compute_logp activation memory
     n_mbs_divisor: 1
   # REQUIRED for Qwen3.5 GDN (bshd format; THD not supported).
   # Automatically disables incompatible Megatron fusions
@@ -178,7 +180,7 @@ ref:
   mb_spec:
     n_mbs: 1
     granularity: 1
-    max_tokens_per_mb: 10240
+    max_tokens_per_mb: 4096   # lowered from 10240 to bound compute_logp activation memory
     n_mbs_divisor: 1
   pad_to_maximum: true   # REQUIRED: mirror actor (both engines need BSHD)
   optimizer: null
