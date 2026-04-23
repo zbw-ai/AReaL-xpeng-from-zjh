@@ -69,6 +69,19 @@ python3 -c "import megatron.core; print('megatron.core.__version__:', getattr(me
 echo ""
 
 echo "================================================================"
+echo " 5a. mbridge qwen3_5 model.py forward() — find preprocess_packed_seqs callsites"
+echo "================================================================"
+MODEL_FILE="${MBRIDGE_QWEN3_5}/model.py"
+if [[ -f "${MODEL_FILE}" ]]; then
+    echo "--- preprocess_packed_seqs/attention_mask/packed_seq_params occurrences:"
+    grep -n "preprocess_packed_seqs\|attention_mask\s*=\|attention_mask is None\|packed_seq_params" "${MODEL_FILE}" 2>&1 | head -40
+    echo ""
+    echo "--- Lines 280-340 (around line 313 where crash happens):"
+    sed -n '270,340p' "${MODEL_FILE}"
+fi
+echo ""
+
+echo "================================================================"
 echo " 5b. mbridge qwen3_5 transformer_config.py (config mapping)"
 echo "================================================================"
 TF_CONFIG="${MBRIDGE_QWEN3_5}/transformer_config.py"
