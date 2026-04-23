@@ -513,6 +513,7 @@ def save_weights_to_hf_with_mbridge_fast(
             )
             for s, gathered_param in zip(_all_gather_specs, _all_gather_outputs):
                 all_gather_outputs[s.global_name] = gathered_param
+        empty_conversion_specs: list[tuple[str, str, tuple]] = []
         for s in expert_specs:
             param = s.param
             if etp_size > 1:
@@ -534,9 +535,24 @@ def save_weights_to_hf_with_mbridge_fast(
                 quantization_config,
                 fp8_direct_convert,
             )
+            if len(converted_names) == 0:
+                empty_conversion_specs.append(
+                    (s.local_name, s.global_name, tuple(param.shape))
+                )
             for n, p in zip(converted_names, converted_params):
                 assert n not in expert_sd, n
                 expert_sd[n] = p
+        if empty_conversion_specs or (n_shards > 0 and len(expert_sd) == 0):
+            model_type = getattr(bridge.hf_config, "model_type", "<unknown>")
+            rank = dist.get_rank()
+            logger.warning(
+                f"[mbridge expert export] rank={rank} model_type={model_type} "
+                f"n_expert_specs={len(expert_specs)} n_empty_conversions="
+                f"{len(empty_conversion_specs)} expert_sd_keys={len(expert_sd)} "
+                f"n_shards={n_shards} "
+                f"sample_empty={empty_conversion_specs[:3]} "
+                f"sample_nonempty_keys={list(expert_sd.keys())[:3]}"
+            )
         # Split the state dict into shards and save the process's own shard.
         shards = split_state_dict_into_shards(expert_sd, n_shards)
 
