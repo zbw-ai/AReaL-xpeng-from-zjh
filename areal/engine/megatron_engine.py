@@ -1200,7 +1200,17 @@ class MegatronEngine(TrainEngine):
             quantization_config=self.quantization_config,
             duplicated_param_names=self._duplicated_param_names,
         )
-        param = remove_padding(name, param, self.hf_config.vocab_size)
+        # Qwen3.5 VL wraps scalars under text_config; fall back if needed.
+        _vocab_size = getattr(
+            self.hf_config,
+            "vocab_size",
+            getattr(getattr(self.hf_config, "text_config", None), "vocab_size", None),
+        )
+        assert _vocab_size is not None, (
+            f"Could not find vocab_size on hf_config {type(self.hf_config).__name__} "
+            f"or text_config."
+        )
+        param = remove_padding(name, param, _vocab_size)
 
         if isinstance(param, FP8BlockwiseTensorHelper):
             # FP8 is stored as uint8, so element_size is 1 byte

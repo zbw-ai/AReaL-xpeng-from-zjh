@@ -757,6 +757,16 @@ def call_engine_method():
 
                 return result
             except AttributeError as e:
+                # Distinguish "method truly missing" from "AttributeError raised
+                # inside the method body" — the latter is the common case and
+                # wrongly reporting "method does not exist" has misled debugging.
+                method_exists = hasattr(engine, method_name)
+                if method_exists:
+                    logger.error(
+                        f"Engine method '{method_name}' raised AttributeError "
+                        f"during execution: {e}\n{traceback.format_exc()}"
+                    )
+                    raise
                 logger.error(f"Method '{method_name}' not found on engine: {e}")
                 raise ValueError(f"Engine does not have method '{method_name}'")
             except Exception as e:
