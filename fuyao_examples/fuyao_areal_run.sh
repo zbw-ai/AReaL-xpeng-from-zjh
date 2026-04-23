@@ -161,6 +161,17 @@ export SGLANG_DISABLE_CUDNN_CHECK=1                  # PyTorch 2.9.1 + CuDNN 9.1
 export TORCHDYNAMO_DISABLE=1
 export TORCH_COMPILE_DISABLE=1
 
+# vLLM env vars aligned with veRL's qwen3_5 proven config
+# (see run_qwen3_5-35b-megatron.sh and run_rlvr_megatron.sh).
+# - VLLM_USE_V1=1: use vLLM V1 engine (required for Qwen3.5 support)
+# - VLLM_DISABLE_CUSTOM_ALL_REDUCE=1: avoid custom all-reduce which has
+#   known issues with TP+Qwen3.5 gated attention variants
+# - VLLM_ALLREDUCE_USE_SYMM_MEM=0: per veRL's 35B script, avoid symmetric
+#   memory allreduce path which conflicts with some TE builds
+export VLLM_USE_V1=1
+export VLLM_DISABLE_CUSTOM_ALL_REDUCE=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
 # Python 配置
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1

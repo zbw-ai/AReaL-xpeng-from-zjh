@@ -1,23 +1,25 @@
 # Qwen3.5-35B-A3B (MoE + GDN) Math RLVR — dapo_math_17k
 #   - Training: Megatron with Expert Parallelism (mbridge)
-#   - Inference: SGLang (TP4, DP4)
+#   - Inference: vLLM (DP4, TP4)
 #   - Algorithm: GRPO
 #   - Data: dapo_math_17k_processed
 #   - Cluster: 4 nodes × 8 GPU = 32 GPU (A100 80G)
 #   - Sequence: 8K max response
 #
 # GPU layout (32 GPUs total):
-#   Actor  (16 GPU): megatron:(attn:d2p2t4|ffn:e8t1) = 16 GPU
-#   SGLang (16 GPU): sglang:d4t4 = DP4 × TP4 = 16 GPU
+#   Actor (16 GPU): megatron:(attn:d2p2t4|ffn:e8t1) = 16 GPU
+#   vLLM  (16 GPU): vllm:d4t4 = DP4 × TP4 = 16 GPU
 #   Ref: colocated with actor
 #
-# NOTE: Qwen3.5 GDN linear attention requires bshd format:
-#   pad_to_maximum=true (no THD/remove_padding support yet)
+# NOTE: Qwen3.5 GDN linear attention requires bshd format on the training
+# side (both actor and ref), hence pad_to_maximum=true on both engines.
+# vLLM has its own attention path and does not need this flag.
+# See veRL's run_qwen3_5-35b-megatron.sh for the proven reference config.
 #
 # Usage:
 #   bash fuyao_examples/fuyao_areal_run.sh \
 #       --run-type math_rlvr \
-#       --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr.yaml
+#       --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm.yaml
 
 experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-math-rlvr
 trial_name: trial0
