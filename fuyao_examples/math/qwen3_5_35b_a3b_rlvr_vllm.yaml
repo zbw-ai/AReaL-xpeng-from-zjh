@@ -9,34 +9,29 @@
 # (docs/fuyao-experiments/qwen3_5-adaptation.md).
 #
 # ─────────────────────────────────────────────────────────────────────
+# Qwen3.5-35B-A3B actual config (verified via inspect_qwen3_5_35b_config.sh):
+#   num_attention_heads=16   num_key_value_heads=2   head_dim=256
+#   hidden_size=2048         num_hidden_layers=40    attn_output_gate=true
+#   num_experts=256          num_experts_per_tok=8   moe_intermediate_size=512
+#
 # GPU layout (32 GPUs total, 4 nodes × 8 GPU):
-#   Actor (16 GPU): megatron:(attn:d2p2t2|ffn:e8t1)
-#     - attn: DP=2, PP=2, TP=2 = 8 GPU
-#     - ffn:  EP=8, ETP=1, PP implicit → 16 GPU across all layers
-#   vLLM  (16 GPU): vllm:d2t8
-#     - DP=2 × TP=8 = 16 GPU
-#     - TP=8 is safe only if num_kv_heads >= 8
+#   Actor (16 GPU): megatron:(attn:d4p2t2|ffn:e8t1)
+#     - attn: DP=4, PP=2, TP=2 (TP=2 is MANDATORY: num_kv_heads=2)
+#     - ffn:  EP=8, ETP=1 (MoE experts sharded across 8 ranks)
+#   vLLM  (16 GPU): vllm:d8t2
+#     - DP=8 × TP=2 (TP=2 is MANDATORY: same constraint)
+#     - TP=1 not an option: 35B bf16 weights (~70 GB) won't fit on single A100-80G
 #   Ref: colocated with actor
 #
 # ─────────────────────────────────────────────────────────────────────
-# ⚠ CRITICAL VERIFICATION BEFORE RUNNING (do not skip):
-#
-# Qwen3.5-35B-A3B's num_key_value_heads MUST be known before TP tuning.
-# From 0.8B experience:
-#   - Actor TP must be <= num_kv_heads (Megatron's num_query_groups bump
-#     when TP > num_kv_heads corrupts the gated attention gate dim by 2×)
-#   - vLLM  TP must be <= num_kv_heads (vLLM's GQA replicate path breaks
-#     weight-update shape alignment when TP > num_kv_heads)
-#
-# Run this first to confirm:
-#   cat /dataset_rc_b1/models/Qwen3.5-35B-A3B/config.json | \
-#       python3 -m json.tool | \
-#       grep -E "num_attention_heads|num_key_value_heads|num_hidden_layers|hidden_size"
-#
-# Based on result, set actor.backend and rollout.backend:
-#   num_kv_heads >= 8:  actor attn TP=8 OK; vllm TP=8 OK (current default)
-#   num_kv_heads == 4:  actor attn TP<=4;   vllm TP<=4 → change to d4t4
-#   num_kv_heads == 2:  actor attn TP<=2;   vllm TP<=2 → change to d8t2 or d8t1 per 0.8B
+# TP constraint explanation (from 0.8B validation findings):
+#   num_kv_heads=2 means Megatron's GQA split handles TP<=2 cleanly.
+#   TP>2 triggers num_query_groups bump (get_query_key_value_tensors:310-315),
+#   inflating the attention gate dim to 2× of Q dim, crashing
+#   _apply_output_gate at mbridge/qwen3_5/attention.py:360.
+#   vLLM side has an analogous GQA replicate bug in its weight-update path.
+#   Disk mode (used here) uses vLLM native load_weights which should tolerate
+#   TP > num_kv_heads, but staying at TP=2 is the safest proven path.
 #
 # ─────────────────────────────────────────────────────────────────────
 # Usage:
@@ -66,7 +61,7 @@ scheduler:
 # ── Rollout (Inference) ──
 # Default assumes num_kv_heads >= 8 (verify before run). Otherwise change TP.
 rollout:
-  backend: "vllm:d2t8"
+  backend: "vllm:d8t2"   # TP=2 (num_kv_heads=2), DP=8 for throughput
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   setup_timeout: 1200.0   # 35B MoE startup over NFS takes time
@@ -95,7 +90,9 @@ gconfig:
 # TP=2 for attention (safe for num_kv_heads >= 2), EP=8 for MoE.
 # PP=2 to fit 35B params + optimizer states across 16 GPU.
 actor:
-  backend: "megatron:(attn:d2p2t2|ffn:e8t1)"
+  # attn: DP=4, PP=2, TP=2 (TP=2 mandatory, num_kv_heads=2)
+  # ffn:  EP=8 × ETP=1 for 256 MoE experts (32 experts per EP rank)
+  backend: "megatron:(attn:d4p2t2|ffn:e8t1)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-35B-A3B

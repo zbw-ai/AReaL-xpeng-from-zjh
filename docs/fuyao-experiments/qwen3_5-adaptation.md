@@ -117,48 +117,65 @@ Weight sync is ~20% of step time. For 35B this ratio will be smaller (compute gr
 
 ### 5.1 Config file
 
-`fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm.yaml` (updated below).
+`fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm.yaml` (production-ready, updated
+with verified parameters below).
 
-Apply all 0.8B learnings. **Key open question**: 35B-A3B's `num_key_value_heads`. Must be
-known before finalizing TP. Recommendation: run `inspect_mbridge.sh` against the 35B model
-path first to read the config.
+**Verified via `inspect_qwen3_5_35b_config.sh` on 2026-04-23**:
 
-### 5.2 Parallelism recommendations (pending config verification)
+| Parameter | Value |
+|-----------|-------|
+| num_attention_heads | 16 |
+| **num_key_value_heads** | **2** (same as 0.8B!) |
+| head_dim | 256 |
+| hidden_size | 2048 |
+| num_hidden_layers | 40 |
+| attn_output_gate | **true** (same as 0.8B) |
+| num_experts | 256 |
+| num_experts_per_tok | 8 |
+| moe_intermediate_size | 512 |
 
-#### Option A — Align with veRL's proven 35B setup (single node 8 GPU, A100-80G)
-Same as `verl/examples/grpo_trainer/run_qwen3_5-35b-megatron.sh`:
+**Consequence**: same TP constraints as 0.8B apply.
+- Actor TP must be ≤ 2
+- vLLM TP must be ≤ 2 (for safety with disk mode; stricter under xccl)
+
+### 5.2 Final parallelism (32 GPU, 4 nodes)
+
+```yaml
+actor:
+  backend: "megatron:(attn:d4p2t2|ffn:e8t1)"
+  # attn: DP=4 × PP=2 × TP=2 = 16 GPU
+  # ffn:  EP=8 × ETP=1 = 256 experts sharded 32-per-rank
+  pad_to_maximum: true
+  weight_update_mode: disk
+
+ref:
+  backend: ${actor.backend}  # colocated
+  pad_to_maximum: true
+
+rollout:
+  backend: "vllm:d8t2"       # DP=8 × TP=2 = 16 GPU
+  # TP=1 infeasible: 35B bf16 weights (~70 GB) exceed A100-80G capacity.
 ```
-actor:  TP=2, PP=1, CP=1, EP=8, ETP=1   (8 GPU)
-rollout: GEN_TP=8                        (8 GPU colocated)
-```
-Advantage: lowest deviation from veRL's validated path.
-Disadvantage: 8 GPU for a 35B-A3B MoE is tight; need aggressive offloading.
 
-#### Option B — 4 nodes × 8 GPU = 32 GPU (scaled up, non-colocated)
-```
-actor:  attn:d2p2t2 + ffn:e8t1 = 16 GPU
-rollout: vllm:d8t2 or vllm:d4t4 = 16 GPU   (depends on num_kv_heads)
-```
-Conservative: start with TP=2 for actor (matches veRL). vLLM TP depends on 35B's num_kv_heads:
-- If `num_kv_heads ≥ 4`: vLLM TP=4 works (`vllm:d4t4`)
-- If `num_kv_heads ≥ 2` only: vLLM TP=2 (`vllm:d8t2`)
-- If `num_kv_heads = 2`: vLLM TP ≤ 2 OR use TP=1 per 0.8B experience
+Aligned with veRL's `TP=2 EP=8 ETP=1` pattern. Only difference: 32 GPU total
+(veRL uses 8 GPU) allows 2 DP replicas + 2 PP stages + 16 GPU for non-colocated vLLM.
 
-### 5.3 Verification checklist before running 35B
+### 5.3 Pre-flight checklist before running 35B
 
-1. **Read 35B config.json**:
-   ```bash
-   cat /dataset_rc_b1/models/Qwen3.5-35B-A3B/config.json | python3 -m json.tool | grep -E "num_attention_heads|num_key_value_heads|num_hidden_layers|hidden_size"
-   ```
-   Or submit a mini inspect job with `inspect_mbridge.sh` pointing at 35B path.
+1. **Disk space on NFS**:
+   35B-A3B bf16 safetensor ≈ 70 GB. Disk-mode writes this every iteration.
+   Ensure NFS has several GB/s write bandwidth and ≥ 200 GB free on
+   `${cluster.fileroot}`.
 
-2. **Decide TP**:
-   - `TP_actor ≤ num_key_value_heads` (strict — triggers gate 2× bug otherwise)
-   - `TP_vllm ≤ num_key_value_heads` (strict — triggers GQA expand bug otherwise, per 0.8B experience)
+2. **Memory sanity**:
+   - Actor per-GPU: ~2 GB (1/16 of 35B params) + optimizer states (fp32 adam = 8× params) + activations
+   - MoE router/shared expert + EP'd experts per rank: ~4 GB experts per GPU
+   - Total per GPU: ~16-20 GB weights + activations → fits in 80 GB ✓
+   - vLLM per TP=2 rank: ~35 GB weights + KV cache → fits in 80 GB ✓
 
-3. **Confirm disk space on NFS**:
-   35B-A3B bf16 safetensor ≈ 70 GB. Disk-mode writes this each iteration. Ensure NFS has
-   several GB/s write bandwidth and ≥ 200 GB free on `${cluster.fileroot}`.
+3. **Expected step time**:
+   Estimated 60-120s per step (conservative). Disk-mode weight sync ~25s
+   (70 GB / ~3 GB/s NFS write), plus ~35-95s compute.
 
 ### 5.4 Known risks / open items
 
