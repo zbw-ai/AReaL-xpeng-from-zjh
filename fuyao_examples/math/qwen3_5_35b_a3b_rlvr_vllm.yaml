@@ -78,10 +78,13 @@ rollout:
   dump_to_file: true
 
 # ── Generation Config ──
+# max_new_tokens aligned with veRL's run_qwen3_5-35b-megatron.sh
+# (data.max_response_length=2048). Needed to fit single sequence into
+# max_tokens_per_mb without OOM.
 gconfig:
   n_samples: 8
   min_new_tokens: 0
-  max_new_tokens: 8192
+  max_new_tokens: 2048
   greedy: false
   temperature: 0.9
   top_p: 1.0
@@ -106,7 +109,7 @@ actor:
   mb_spec:
     n_mbs: 1
     granularity: 1
-    max_tokens_per_mb: 4096   # lowered from 10240 to bound compute_logp activation memory
+    max_tokens_per_mb: 4096   # holds 1 seq (max_new_tokens=2048 + prompt); bounds activation
     n_mbs_divisor: 1
   # REQUIRED for Qwen3.5 GDN (bshd format; THD not supported).
   # Automatically disables incompatible Megatron fusions
@@ -180,7 +183,7 @@ ref:
   mb_spec:
     n_mbs: 1
     granularity: 1
-    max_tokens_per_mb: 4096   # lowered from 10240 to bound compute_logp activation memory
+    max_tokens_per_mb: 4096   # holds 1 seq (max_new_tokens=2048 + prompt); bounds activation
     n_mbs_divisor: 1
   pad_to_maximum: true   # REQUIRED: mirror actor (both engines need BSHD)
   optimizer: null
@@ -195,7 +198,7 @@ vllm:
   seed: ${seed}
   dtype: ${actor.dtype}
   max_num_seqs: 64
-  max_model_len: 10240
+  max_model_len: 4096    # 2048 gen + 2048 prompt headroom
   gpu_memory_utilization: 0.8
   enforce_eager: true   # avoids cudagraph compat issues for Qwen3.5
 
