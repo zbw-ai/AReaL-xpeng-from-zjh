@@ -4,9 +4,14 @@
 #   and single node → 2-5 min init vs 10-20 min for 35B.
 #
 # GPU layout (1 node × 8 GPU):
-#   Actor  (4 GPU): megatron:d1p1t4 — exercises TP=4 seq alignment
+#   Actor  (4 GPU): megatron:d2p1t2 — TP=2 (num_kv_heads=2 forbids TP>2)
 #   vLLM   (4 GPU): vllm:d1t4
 #   Ref: colocated with actor
+#
+# CRITICAL: Qwen3.5-0.8B has num_key_value_heads=2. Megatron's GQA split
+# bumps num_query_groups to world_size when num_kv_heads < TP, which
+# inflates the attention gate dim vs Q dim (2x mismatch) and crashes
+# _apply_output_gate at mbridge qwen3_5/attention.py:360. Must use TP<=2.
 #
 # NOTE: Keep pad_to_maximum=true — same GDN bshd requirement as 35B
 #
@@ -63,7 +68,7 @@ gconfig:
 # ── Actor (Training) — Megatron TP=4: 4 GPU ──
 # Exercises TP seq alignment fix (align_to = tp_size * cp_size * 2 if cp>1 else tp_size = 4)
 actor:
-  backend: "megatron:d1p1t4"
+  backend: "megatron:d2p1t2"  # TP=2: num_kv_heads=2 forbids TP>2 (see GPU layout note)
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-0.8B
