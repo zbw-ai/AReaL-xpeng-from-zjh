@@ -764,41 +764,16 @@ def convert_qwen3_5_to_hf(
     We first try hybrid-attention mapping (Bailing-style), then fallback to
     Qwen3-MoE mapping for compatible parameter layouts.
 
-    For Qwen3.5-VL models the Megatron naming has an extra ``language_model.``
-    prefix (vision_model params are skipped upstream). Strip it before
-    dispatching to the underlying LM converters, then re-prefix the returned
-    HF names with ``language_model.`` to match the HF checkpoint layout.
+    NOTE: This fallback-chain does not handle VL-prefix naming. For VL
+    models, ``megatron_engine._impl_update_weight_from_distributed`` should
+    call ``self.bridge._weight_to_hf_format`` directly (mbridge's native
+    export), matching veRL's ``vanilla_mbridge=True`` path.
     """
-    # Detect and strip the VL wrapper. Two possible prefixes depending on
-    # DDP/Float16Module wrapping state.
-    vl_prefix_stripped = False
-    stripped_name = name
-    if name.startswith("module.module.language_model."):
-        stripped_name = "module.module." + name[len("module.module.language_model.") :]
-        vl_prefix_stripped = True
-    elif name.startswith("language_model."):
-        stripped_name = name[len("language_model.") :]
-        vl_prefix_stripped = True
-
     converters = (convert_bailingmoe_to_hf, convert_qwen3moe_to_hf)
     last_error: Exception | None = None
     for fn in converters:
         try:
-            result = fn(tf_config, stripped_name, param)
-            # HF names for VL use `model.language_model.<hf_name>`; LM-only
-            # converters return `model.<hf_name>`. Re-prefix to match
-            # Qwen3_5ForConditionalGeneration state_dict keys.
-            if vl_prefix_stripped:
-                result = [
-                    (
-                        hf_name.replace("model.", "model.language_model.", 1)
-                        if hf_name.startswith("model.")
-                        else hf_name,
-                        tensor,
-                    )
-                    for hf_name, tensor in result
-                ]
-            return result
+            return fn(tf_config, name, param)
         except ValueError as e:
             last_error = e
             continue

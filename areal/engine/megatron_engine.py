@@ -1220,6 +1220,27 @@ class MegatronEngine(TrainEngine):
 
         return param, param_size
 
+    def _mbridge_convert_to_hf(self, name: str, param):
+        """Use mbridge's native Megatron→HF converter.
+
+        Matches veRL's ``vanilla_mbridge=True`` path (bridge.export_weights
+        internally calls bridge._weight_to_hf_format per-param). This handles
+        all model-specific naming (VL language_model./vision_model./lm_head
+        prefixes, QKV splits, MoE expert names, etc.) without us maintaining
+        a parallel mapping.
+
+        Strips the Megatron DDP/Float16Module ``module.module.`` wrapping
+        before dispatch because mbridge's own iteration expects the
+        already-unwrapped state_dict style name.
+        """
+        mbridge_name = name
+        for prefix in ("module.module.", "module."):
+            if mbridge_name.startswith(prefix):
+                mbridge_name = mbridge_name[len(prefix) :]
+                break
+        hf_names, hf_tensors = self.bridge._weight_to_hf_format(mbridge_name, param)
+        return list(zip(hf_names, hf_tensors))
+
     def _impl_update_weight_from_distributed(
         self,
         meta: WeightUpdateMeta,
@@ -1238,16 +1259,22 @@ class MegatronEngine(TrainEngine):
             self._update_bucket_weights_from_distributed(meta, converted_named_tensors)
             buffer_size = 0
 
-        converted_named_tensors.extend(
-            convert_to_hf(
-                self.tf_config,
-                self.hf_config.model_type,
-                name,
-                param,
-                quantization_config=self.quantization_config,
-                fp8_direct_convert=self.fp8_direct_convert,
+        # For Qwen3.5-family, use mbridge's native converter (matches veRL).
+        # The registry-based convert_to_hf doesn't know VL naming quirks.
+        model_type = self.hf_config.model_type
+        if self.bridge is not None and "qwen3_5" in model_type:
+            converted_named_tensors.extend(self._mbridge_convert_to_hf(name, param))
+        else:
+            converted_named_tensors.extend(
+                convert_to_hf(
+                    self.tf_config,
+                    model_type,
+                    name,
+                    param,
+                    quantization_config=self.quantization_config,
+                    fp8_direct_convert=self.fp8_direct_convert,
+                )
             )
-        )
         buffer_size += param_size
         return buffer_size
 
@@ -1309,17 +1336,22 @@ class MegatronEngine(TrainEngine):
         gathered_params = sum(gathered_params, [])
 
         converted_hf_tensors = []
+        model_type = self.hf_config.model_type
+        use_mbridge_native = self.bridge is not None and "qwen3_5" in model_type
         for name, param in gathered_params:
-            converted_hf_tensors.extend(
-                convert_to_hf(
-                    self.tf_config,
-                    self.hf_config.model_type,
-                    name,
-                    param,
-                    quantization_config=self.quantization_config,
-                    fp8_direct_convert=self.fp8_direct_convert,
+            if use_mbridge_native:
+                converted_hf_tensors.extend(self._mbridge_convert_to_hf(name, param))
+            else:
+                converted_hf_tensors.extend(
+                    convert_to_hf(
+                        self.tf_config,
+                        model_type,
+                        name,
+                        param,
+                        quantization_config=self.quantization_config,
+                        fp8_direct_convert=self.fp8_direct_convert,
+                    )
                 )
-            )
 
         self._update_bucket_weights_from_distributed(meta, converted_hf_tensors)
 
