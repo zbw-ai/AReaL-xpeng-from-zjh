@@ -150,6 +150,32 @@ def packed_context_parallel_forward(
         tree_triton_data if tree_triton_data is not None else attention_mask
     )
 
+    # Diagnostic: print exactly what we pass to model (only once per process).
+    # Previous runs had conflicting signals — our dict had no cu_seqlens but
+    # the error message showed packed_seq_params populated. This confirms.
+    global _packed_ctx_fwd_debug_printed
+    try:
+        _packed_ctx_fwd_debug_printed
+    except NameError:
+        _packed_ctx_fwd_debug_printed = False  # module-level flag
+    if not _packed_ctx_fwd_debug_printed:
+        try:
+            import sys as _sys
+            print(
+                f"[packed_context_parallel_forward debug] "
+                f"input_ids.shape={tuple(input_ids.shape)}, "
+                f"attention_mask={type(final_attention_mask).__name__ if final_attention_mask is not None else 'None'}"
+                f"{tuple(final_attention_mask.shape) if final_attention_mask is not None else ''}, "
+                f"position_ids={type(position_ids).__name__ if position_ids is not None else 'None'}, "
+                f"packed_seq_params={packed_seq_params}, "
+                f"input_keys={list(input_.keys())}",
+                file=_sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
+        _packed_ctx_fwd_debug_printed = True
+
     try:
         output = model(
             input_ids=input_ids,
@@ -160,7 +186,8 @@ def packed_context_parallel_forward(
     except Exception as e:
         raise RuntimeError(
             f"Error occurred in packed context parallel forward pass on model {model} "
-            f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params}."
+            f"with input_ids shape {input_ids.shape} and packed_seq_params {packed_seq_params} "
+            f"and attention_mask {'None' if final_attention_mask is None else tuple(final_attention_mask.shape)}."
         ) from e
 
     model_vp_stage = getattr(model, "vp_stage", None)
