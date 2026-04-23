@@ -4,14 +4,16 @@
 #   and single node → 2-5 min init vs 10-20 min for 35B.
 #
 # GPU layout (1 node × 8 GPU):
-#   Actor  (4 GPU): megatron:d2p1t2 — TP=2 (num_kv_heads=2 forbids TP>2)
-#   vLLM   (4 GPU): vllm:d1t4
+#   Actor  (4 GPU): megatron:d2p1t2 — TP=2
+#   vLLM   (4 GPU): vllm:d4t1      — TP=1 (one 0.8B per GPU, 4 DP replicas)
 #   Ref: colocated with actor
 #
-# CRITICAL: Qwen3.5-0.8B has num_key_value_heads=2. Megatron's GQA split
-# bumps num_query_groups to world_size when num_kv_heads < TP, which
-# inflates the attention gate dim vs Q dim (2x mismatch) and crashes
-# _apply_output_gate at mbridge qwen3_5/attention.py:360. Must use TP<=2.
+# CRITICAL CONSTRAINTS (Qwen3.5-0.8B has num_key_value_heads=2, num_q_heads=8):
+# - Actor TP must be ≤ num_kv_heads to avoid Megatron's num_query_groups
+#   bump in get_query_key_value_tensors (caused _apply_output_gate 2× bug).
+# - vLLM TP must be ≤ num_kv_heads too — with TP > num_kv_heads vLLM
+#   replicates KV but GQA weight-update shape check fails (dim 2 mismatch
+#   when Megatron-exported tensor is scattered). Use TP=1 for simplicity.
 #
 # NOTE: Keep pad_to_maximum=true — same GDN bshd requirement as 35B
 #
@@ -39,9 +41,9 @@ cluster:
 scheduler:
   type: local
 
-# ── Rollout (Inference) — vLLM TP4 × DP1 = 4 GPU ──
+# ── Rollout (Inference) — vLLM TP1 × DP4 = 4 GPU ──
 rollout:
-  backend: "vllm:d1t4"
+  backend: "vllm:d4t1"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   setup_timeout: 600.0
