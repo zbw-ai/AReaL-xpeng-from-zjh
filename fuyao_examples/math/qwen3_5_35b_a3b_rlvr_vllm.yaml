@@ -105,7 +105,7 @@ actor:
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
-  grad_reduce_dtype: float32
+  grad_reduce_dtype: bfloat16   # bf16 grad reduction halves memory vs float32
   mb_spec:
     n_mbs: 1
     granularity: 1
@@ -117,7 +117,10 @@ actor:
   #  gradient_accumulation_fusion) — see megatron_engine.py.
   pad_to_maximum: true
   optimizer:
-    type: adam
+    # adam_bf16: Megatron auto-enables precision-aware optimizer with
+    # exp_avg_dtype=bf16 exp_avg_sq_dtype=bf16 → halves optimizer memory
+    # (each state goes 4B→2B). Mirrors veRL's use_precision_aware_optimizer.
+    type: adam_bf16
     lr: 1.0e-6
     weight_decay: 0.01
     beta1: 0.9
@@ -129,14 +132,15 @@ actor:
   megatron:
     wrap_with_ddp: true
     ddp:
-      grad_reduce_in_fp32: true
+      grad_reduce_in_fp32: false  # align with grad_reduce_dtype=bf16
       overlap_grad_reduce: false
       overlap_param_gather: false
       use_distributed_optimizer: true
     use_deterministic_algorithms: true
+    # Aggressive recompute to free activation memory during ppo_update.
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 1
+    recompute_num_layers: 2       # bumped from 1 — trades compute for memory
     moe_router_dtype: fp32
     moe_token_dispatcher_type: alltoall
   eps_clip: 0.2
