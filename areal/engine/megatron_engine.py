@@ -622,6 +622,32 @@ class MegatronEngine(TrainEngine):
                 orig_pos_ids = mb_input.padded_mb["position_ids"]
                 mb_input.padded_mb["position_ids"] = None
 
+            # Diagnostic: log padded_mb keys/shapes once per rank to trace any
+            # unexpected cu_seqlens leak in the pad_to_maximum path.
+            if self.config.pad_to_maximum and not getattr(
+                self, "_padded_mb_debug_printed", False
+            ):
+                try:
+                    import sys as _sys
+                    _dbg_summary = {
+                        k: (tuple(v.shape) if hasattr(v, "shape") else type(v).__name__)
+                        for k, v in mb_input.padded_mb.items()
+                    }
+                    print(
+                        f"[pad_to_maximum debug] padded_mb keys/shapes: {_dbg_summary}",
+                        file=_sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                self._padded_mb_debug_printed = True
+
+            # Defensive: under pad_to_maximum, cu_seqlens MUST NOT be in padded_mb
+            # (triggers THD branch in packed_context_parallel_forward which nukes
+            # attention_mask — mbridge then crashes at preprocess_packed_seqs).
+            if self.config.pad_to_maximum and "cu_seqlens" in mb_input.padded_mb:
+                del mb_input.padded_mb["cu_seqlens"]
+
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
 
             # Restore original position_ids after forward so downstream readers
