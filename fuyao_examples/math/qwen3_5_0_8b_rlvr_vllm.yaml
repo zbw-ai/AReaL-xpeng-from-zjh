@@ -123,7 +123,11 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  weight_update_mode: xccl
+  # Use disk mode for Qwen3.5: mbridge online converter produces q_proj with
+  # q||gate concat layout that vLLM's qwen3_5 loader doesn't accept (dim 2
+  # mismatch 4 vs 8 in weight update). Disk mode writes HF safetensor then
+  # vLLM reloads — slow but correct for 0.8B validation.
+  weight_update_mode: disk
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
