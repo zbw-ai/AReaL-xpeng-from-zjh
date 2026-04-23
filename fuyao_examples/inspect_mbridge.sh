@@ -69,6 +69,39 @@ python3 -c "import megatron.core; print('megatron.core.__version__:', getattr(me
 echo ""
 
 echo "================================================================"
+echo " 5b. mbridge qwen3_5 transformer_config.py (config mapping)"
+echo "================================================================"
+TF_CONFIG="${MBRIDGE_QWEN3_5}/transformer_config.py"
+if [[ -f "${TF_CONFIG}" ]]; then
+    cat -n "${TF_CONFIG}"
+fi
+echo ""
+
+echo "================================================================"
+echo " 5c. mbridge qwen3_5 base_bridge.py (attention_output_gate handling)"
+echo "================================================================"
+BASE_BRIDGE="${MBRIDGE_QWEN3_5}/base_bridge.py"
+if [[ -f "${BASE_BRIDGE}" ]]; then
+    echo "--- attention_output_gate / attn_output_gate occurrences:"
+    grep -n "attention_output_gate\|attn_output_gate\|output_gate" "${BASE_BRIDGE}" 2>&1
+    echo ""
+    echo "--- Full base_bridge.py (first 300 lines):"
+    head -300 "${BASE_BRIDGE}"
+fi
+echo ""
+
+echo "================================================================"
+echo " 5d. Megatron get_query_key_value_tensors (full impl)"
+echo "================================================================"
+MEGATRON_ATT="/usr/local/lib/python3.12/dist-packages/megatron/core/transformer/attention.py"
+echo "--- Search output_gate related split:"
+grep -n "output_gate\|gate_dim\|num_query_groups\|q_projection_size\|kv_projection_size" "${MEGATRON_ATT}" 2>&1 | head -30
+echo ""
+echo "--- Full get_query_key_value_tensors:"
+awk '/def get_query_key_value_tensors/,/^    def [a-z]/' "${MEGATRON_ATT}" | head -150
+echo ""
+
+echo "================================================================"
 echo " 6. Qwen3.5 model config (if model path accessible)"
 echo "================================================================"
 MODEL_PATH="/dataset_rc_b1/models/Qwen3.5-0.8B"
