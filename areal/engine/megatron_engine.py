@@ -1401,6 +1401,11 @@ class MegatronEngine(TrainEngine):
         for name, param in get_named_parameters(self.model, num_moe_experts):
             if ".experts." in name:
                 continue
+            # Skip VL vision-tower params for text-only training: mbridge's
+            # qwen3_5 converter only maps LM params. Vision weights are frozen
+            # in text RLVR so skipping is semantically safe.
+            if ".vision_model." in name or name.startswith("vision_model."):
+                continue
             buffer_size = self._impl_update_weight_from_distributed(
                 meta,
                 name,
@@ -1421,6 +1426,8 @@ class MegatronEngine(TrainEngine):
 
         for name, param in get_named_parameters(self.model, num_moe_experts):
             if ".experts." not in name:
+                continue
+            if ".vision_model." in name or name.startswith("vision_model."):
                 continue
             buffer_size = self._impl_update_expert_weight_from_distributed(
                 meta,
