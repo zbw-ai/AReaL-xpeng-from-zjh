@@ -1,21 +1,44 @@
 # Qwen3.5-35B-A3B (MoE + GDN) Math RLVR — dapo_math_17k
 #   - Training: Megatron with Expert Parallelism (mbridge)
-#   - Inference: vLLM (DP4, TP4)
+#   - Inference: vLLM
 #   - Algorithm: GRPO
 #   - Data: dapo_math_17k_processed
 #   - Cluster: 4 nodes × 8 GPU = 32 GPU (A100 80G)
-#   - Sequence: 8K max response
 #
-# GPU layout (32 GPUs total):
-#   Actor (16 GPU): megatron:(attn:d2p2t4|ffn:e8t1) = 16 GPU
-#   vLLM  (16 GPU): vllm:d4t4 = DP4 × TP4 = 16 GPU
+# Based on ALL learnings from the Qwen3.5-0.8B validation
+# (docs/fuyao-experiments/qwen3_5-adaptation.md).
+#
+# ─────────────────────────────────────────────────────────────────────
+# GPU layout (32 GPUs total, 4 nodes × 8 GPU):
+#   Actor (16 GPU): megatron:(attn:d2p2t2|ffn:e8t1)
+#     - attn: DP=2, PP=2, TP=2 = 8 GPU
+#     - ffn:  EP=8, ETP=1, PP implicit → 16 GPU across all layers
+#   vLLM  (16 GPU): vllm:d2t8
+#     - DP=2 × TP=8 = 16 GPU
+#     - TP=8 is safe only if num_kv_heads >= 8
 #   Ref: colocated with actor
 #
-# NOTE: Qwen3.5 GDN linear attention requires bshd format on the training
-# side (both actor and ref), hence pad_to_maximum=true on both engines.
-# vLLM has its own attention path and does not need this flag.
-# See veRL's run_qwen3_5-35b-megatron.sh for the proven reference config.
+# ─────────────────────────────────────────────────────────────────────
+# ⚠ CRITICAL VERIFICATION BEFORE RUNNING (do not skip):
 #
+# Qwen3.5-35B-A3B's num_key_value_heads MUST be known before TP tuning.
+# From 0.8B experience:
+#   - Actor TP must be <= num_kv_heads (Megatron's num_query_groups bump
+#     when TP > num_kv_heads corrupts the gated attention gate dim by 2×)
+#   - vLLM  TP must be <= num_kv_heads (vLLM's GQA replicate path breaks
+#     weight-update shape alignment when TP > num_kv_heads)
+#
+# Run this first to confirm:
+#   cat /dataset_rc_b1/models/Qwen3.5-35B-A3B/config.json | \
+#       python3 -m json.tool | \
+#       grep -E "num_attention_heads|num_key_value_heads|num_hidden_layers|hidden_size"
+#
+# Based on result, set actor.backend and rollout.backend:
+#   num_kv_heads >= 8:  actor attn TP=8 OK; vllm TP=8 OK (current default)
+#   num_kv_heads == 4:  actor attn TP<=4;   vllm TP<=4 → change to d4t4
+#   num_kv_heads == 2:  actor attn TP<=2;   vllm TP<=2 → change to d8t2 or d8t1 per 0.8B
+#
+# ─────────────────────────────────────────────────────────────────────
 # Usage:
 #   bash fuyao_examples/fuyao_areal_run.sh \
 #       --run-type math_rlvr \
@@ -40,12 +63,13 @@ cluster:
 scheduler:
   type: local
 
-# ── Rollout (Inference) — vLLM TP4 × DP4 = 16 GPU ──
+# ── Rollout (Inference) ──
+# Default assumes num_kv_heads >= 8 (verify before run). Otherwise change TP.
 rollout:
-  backend: "vllm:d4t4"
+  backend: "vllm:d2t8"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
-  setup_timeout: 1200.0   # 35B MoE × DP4 over NFS needs >600s
+  setup_timeout: 1200.0   # 35B MoE startup over NFS takes time
   max_concurrent_rollouts: 64
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
@@ -66,11 +90,12 @@ gconfig:
   top_p: 1.0
   top_k: -1
 
-# ── Actor (Training) — Megatron MoE: 16 GPU ──
-# attn: d2 × p2 × t4 = 16 GPU
-# ffn:  dp(auto) × e8 × etp1 × p2 = 16 GPU
+# ── Actor (Training) ──
+# Default aligns with veRL's run_qwen3_5-35b-megatron.sh:
+# TP=2 for attention (safe for num_kv_heads >= 2), EP=8 for MoE.
+# PP=2 to fit 35B params + optimizer states across 16 GPU.
 actor:
-  backend: "megatron:(attn:d2p2t4|ffn:e8t1)"
+  backend: "megatron:(attn:d2p2t2|ffn:e8t1)"
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
@@ -84,7 +109,11 @@ actor:
     granularity: 1
     max_tokens_per_mb: 10240
     n_mbs_divisor: 1
-  pad_to_maximum: true   # REQUIRED: Qwen3.5 GDN requires bshd format (no THD support)
+  # REQUIRED for Qwen3.5 GDN (bshd format; THD not supported).
+  # Automatically disables incompatible Megatron fusions
+  # (apply_rope_fusion, masked_softmax_fusion, bias_*_fusion,
+  #  gradient_accumulation_fusion) — see megatron_engine.py.
+  pad_to_maximum: true
   optimizer:
     type: adam
     lr: 1.0e-6
@@ -125,7 +154,12 @@ actor:
     mean_level: group
     std_level: group
     group_size: ${gconfig.n_samples}
-  weight_update_mode: xccl
+  # Use disk mode: xccl path is incompatible with Qwen3.5's q||gate
+  # concat q_proj format (vLLM's internal buffer layout mismatch).
+  # Disk mode writes HF safetensor, vLLM reloads via native load_weights.
+  # At 35B with ~70 GB per iteration over NFS, weight sync ~20-30s which
+  # is comparable to (or less than) compute per step. Acceptable.
+  weight_update_mode: disk
   max_new_tokens: ${gconfig.max_new_tokens}
   scheduling_spec:
     - task_type: worker
@@ -149,7 +183,7 @@ ref:
     granularity: 1
     max_tokens_per_mb: 10240
     n_mbs_divisor: 1
-  pad_to_maximum: true   # REQUIRED: same as actor — Qwen3.5 GDN forbids THD path
+  pad_to_maximum: true   # REQUIRED: mirror actor (both engines need BSHD)
   optimizer: null
   scheduling_strategy:
     type: colocation
@@ -164,7 +198,7 @@ vllm:
   max_num_seqs: 64
   max_model_len: 10240
   gpu_memory_utilization: 0.8
-  enforce_eager: true
+  enforce_eager: true   # avoids cudagraph compat issues for Qwen3.5
 
 # ── Datasets — dapo_math_17k ──
 train_dataset:
