@@ -78,11 +78,10 @@ rollout:
   dump_to_file: true
 
 # ── Generation Config ──
-# max_new_tokens aligned with veRL's run_qwen3_5-35b-megatron.sh
-# (data.max_response_length=2048). Needed to fit single sequence into
-# max_tokens_per_mb without OOM.
+# Reduced n_samples to cut total rollout volume for OOM-free ppo_update.
+# max_new_tokens=2048 aligns with veRL's 35B script.
 gconfig:
-  n_samples: 8
+  n_samples: 4            # reduced 8 → 4 to halve rollout volume
   min_new_tokens: 0
   max_new_tokens: 2048
   greedy: false
@@ -105,7 +104,7 @@ actor:
   disable_dropout: true
   gradient_checkpointing: true
   dtype: bfloat16
-  grad_reduce_dtype: bfloat16   # bf16 grad reduction halves memory vs float32
+  grad_reduce_dtype: float32   # keep fp32 for training precision
   mb_spec:
     n_mbs: 1
     granularity: 1
@@ -117,10 +116,9 @@ actor:
   #  gradient_accumulation_fusion) — see megatron_engine.py.
   pad_to_maximum: true
   optimizer:
-    # adam_bf16: Megatron auto-enables precision-aware optimizer with
-    # exp_avg_dtype=bf16 exp_avg_sq_dtype=bf16 → halves optimizer memory
-    # (each state goes 4B→2B). Mirrors veRL's use_precision_aware_optimizer.
-    type: adam_bf16
+    # Keep standard adam (fp32 states) to preserve training precision.
+    # OOM headroom provided by reduced batch_size + n_samples instead.
+    type: adam
     lr: 1.0e-6
     weight_decay: 0.01
     beta1: 0.9
@@ -132,15 +130,15 @@ actor:
   megatron:
     wrap_with_ddp: true
     ddp:
-      grad_reduce_in_fp32: false  # align with grad_reduce_dtype=bf16
+      grad_reduce_in_fp32: true    # fp32 grad reduction for precision
       overlap_grad_reduce: false
       overlap_param_gather: false
       use_distributed_optimizer: true
     use_deterministic_algorithms: true
-    # Aggressive recompute to free activation memory during ppo_update.
+    # Full recompute of every layer to minimize activation memory.
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 2       # bumped from 1 — trades compute for memory
+    recompute_num_layers: 1
     moe_router_dtype: fp32
     moe_token_dispatcher_type: alltoall
   eps_clip: 0.2
@@ -207,8 +205,11 @@ vllm:
   enforce_eager: true   # avoids cudagraph compat issues for Qwen3.5
 
 # ── Datasets — dapo_math_17k ──
+# batch_size reduced 8 → 4 (combined with n_samples 8 → 4 this cuts total
+# rollout volume 4x: from 64 → 16 trajectories per iteration). Mitigates
+# OOM during ppo_update without sacrificing training precision.
 train_dataset:
-  batch_size: 8
+  batch_size: 4
   shuffle: true
   pin_memory: true
   num_workers: 4
@@ -216,7 +217,7 @@ train_dataset:
   type: dapo_math
 
 valid_dataset:
-  batch_size: 8
+  batch_size: 4
   pin_memory: true
   num_workers: 4
   path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
