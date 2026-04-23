@@ -195,6 +195,11 @@ class PPOTrainer:
             self.critic.initialize(**engine_init_kwargs, role="critic")
         if self.ref is not None:
             self.ref.initialize(**engine_init_kwargs, role="ref")
+            # Offload ref to CPU after init so it doesn't compete with the
+            # colocated actor during rollout/ppo_update. The per-iter hook
+            # around ref.compute_logp brings it back to GPU just for logp.
+            if config.enable_offload:
+                self.ref.offload()
 
         self.teacher = None
         if config.teacher is not None:
@@ -341,7 +346,9 @@ class PPOTrainer:
             epoch = global_step // steps_per_epoch
             step = global_step % steps_per_epoch
 
-            _t_step_start = _time.perf_counter()  # whole step timer (aligned with verl v070)
+            _t_step_start = (
+                _time.perf_counter()
+            )  # whole step timer (aligned with verl v070)
             _t_rollout_start = _time.perf_counter()
             with (
                 stats_tracker.record_timing("rollout"),
@@ -402,10 +409,19 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
-                    for traj, logp in zip(rollout_batch, ref_logps):
-                        traj["ref_logp"] = logp
-                    self.ref.get_device_stats().log("ref logp")
+                    # Bring ref back to GPU just for this logp pass, then
+                    # free GPU for the subsequent actor ppo_update (ref is
+                    # colocated with actor on the same ranks).
+                    if config.enable_offload:
+                        self.ref.onload()
+                    try:
+                        ref_logps = self.ref.compute_logp(rollout_batch)
+                        for traj, logp in zip(rollout_batch, ref_logps):
+                            traj["ref_logp"] = logp
+                        self.ref.get_device_stats().log("ref logp")
+                    finally:
+                        if config.enable_offload:
+                            self.ref.offload()
 
             if self.teacher is not None:
                 with (
@@ -969,7 +985,9 @@ class PPOTrainer:
                     "Missing token stats for perf metrics: "
                     "n_seqs=%d, avg_seq_len=%s, train_tokens=%d. "
                     "Throughput will be 0 for this step.",
-                    _n_seqs, _avg_seq_len, _train_tokens,
+                    _n_seqs,
+                    _avg_seq_len,
+                    _train_tokens,
                 )
 
             # Use whole-step time for overall throughput (aligned with verl v070),

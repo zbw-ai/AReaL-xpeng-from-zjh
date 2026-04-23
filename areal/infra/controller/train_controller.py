@@ -586,6 +586,19 @@ class TrainController:
         self._check_rollout_engine_connected()
         self._custom_function_call("update_weights", meta=meta)
 
+    def offload(self) -> None:
+        """Offload engine params/optim/grad to CPU via torch_memory_saver.
+
+        No-op if ``enable_offload`` was not set during launch (TMS not loaded).
+        The underlying engine (FSDP/Megatron/Archon) guards internally, but the
+        trainer should only invoke this on engines that had TMS enabled.
+        """
+        self._custom_function_call("offload")
+
+    def onload(self) -> None:
+        """Bring engine memory back to GPU after a previous :meth:`offload`."""
+        self._custom_function_call("onload")
+
     def get_device_stats(self):
         return self._custom_function_call("get_device_stats")
 
