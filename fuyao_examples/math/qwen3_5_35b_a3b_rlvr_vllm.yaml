@@ -160,10 +160,12 @@ actor:
   reward_scaling: 1.0
   reward_bias: 0.0
   kl_ctl: 0.001
-  # Split PPO update into 4 minibatches (was 2) — v11 hit 75.25/79.25 GB
-  # (94.9%) on ppo_update peak, only ~4 GB headroom. Smaller minibatches
-  # cut activation memory further without changing effective global batch.
-  ppo_n_minibatches: 4
+  # Keep at 2 (already the maximum): batch_size=4 × n_samples=2 = 8 total
+  # samples; ppo_n_minibatches=2 → 4 samples per minibatch = DP=4 exactly.
+  # ppo_n_minibatches=4 would make 2 samples per minibatch < DP=4 and crash
+  # balanced_greedy_partition ("Number of items must be >= K"). Further
+  # activation cuts require more GPU (higher PP or more nodes).
+  ppo_n_minibatches: 2
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 2.0
