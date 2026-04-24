@@ -225,14 +225,16 @@ def _qwen3_5_moe_fallback_expert_export(
         gate_weight, up_weight = merged_param.chunk(2, dim=0)
         return (
             [
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
-                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight",
+                f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
+                f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight",
             ],
             [gate_weight, up_weight],
         )
     if linear_name == "linear_fc2":
         return (
-            [f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"],
+            [
+                f"model.language_model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"
+            ],
             [merged_param],
         )
     return [], []
