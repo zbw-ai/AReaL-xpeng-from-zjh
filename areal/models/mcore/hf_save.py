@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -198,6 +199,43 @@ def split_state_dict_into_shards(state_dict: dict, n_shards: int) -> list[dict]:
         start += size
         shards.append(shard)
     return shards
+
+
+def _qwen3_5_moe_fallback_expert_export(
+    global_name: str, merged_param: torch.Tensor
+) -> tuple[list[str], list[torch.Tensor]]:
+    """Fallback expert export for qwen3_5_moe when mbridge returns no outputs.
+
+    The current mbridge bridge accepts qwen3_5_moe expert names but returns empty
+    outputs for MoE expert weights during disk export. Reuse AReaL's existing
+    Megatron->HF naming semantics here so the disk save path stays aligned with
+    the direct conversion path.
+    """
+
+    pattern = (
+        r"(?:(?:module\.module|language_model)\.)?decoder\.layers\.(\d+)\."
+        r"mlp\.experts\.(linear_fc[12])\.weight(\d+)"
+    )
+    match = re.fullmatch(pattern, global_name)
+    if match is None:
+        return [], []
+
+    layer_idx, linear_name, expert_idx = match.groups()
+    if linear_name == "linear_fc1":
+        gate_weight, up_weight = merged_param.chunk(2, dim=0)
+        return (
+            [
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.gate_proj.weight",
+                f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.up_proj.weight",
+            ],
+            [gate_weight, up_weight],
+        )
+    if linear_name == "linear_fc2":
+        return (
+            [f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.down_proj.weight"],
+            [merged_param],
+        )
+    return [], []
 
 
 @dataclass
@@ -514,6 +552,8 @@ def save_weights_to_hf_with_mbridge_fast(
             for s, gathered_param in zip(_all_gather_specs, _all_gather_outputs):
                 all_gather_outputs[s.global_name] = gathered_param
         empty_conversion_specs: list[tuple[str, str, tuple]] = []
+        fallback_conversion_specs: list[tuple[str, list[str]]] = []
+        model_type = getattr(bridge.hf_config, "model_type", None)
         for s in expert_specs:
             param = s.param
             if etp_size > 1:
@@ -528,6 +568,14 @@ def save_weights_to_hf_with_mbridge_fast(
             converted_names, converted_params = bridge._weight_to_hf_format(
                 s.global_name, merge_params
             )
+            if len(converted_names) == 0 and model_type == "qwen3_5_moe":
+                converted_names, converted_params = _qwen3_5_moe_fallback_expert_export(
+                    s.global_name, merge_params
+                )
+                if converted_names:
+                    fallback_conversion_specs.append(
+                        (s.global_name, converted_names.copy())
+                    )
             converted_names, converted_params = _maybe_convert_to_torch_fp8_params(
                 s.global_name,
                 converted_names,
@@ -542,16 +590,31 @@ def save_weights_to_hf_with_mbridge_fast(
             for n, p in zip(converted_names, converted_params):
                 assert n not in expert_sd, n
                 expert_sd[n] = p
+        if fallback_conversion_specs:
+            rank = dist.get_rank()
+            logger.info(
+                f"[qwen3_5_moe expert fallback] rank={rank} "
+                f"n_fallback_conversions={len(fallback_conversion_specs)} "
+                f"sample_fallback={fallback_conversion_specs[:3]}"
+            )
         if empty_conversion_specs or (n_shards > 0 and len(expert_sd) == 0):
-            model_type = getattr(bridge.hf_config, "model_type", "<unknown>")
+            model_type = model_type or "<unknown>"
             rank = dist.get_rank()
             logger.warning(
                 f"[mbridge expert export] rank={rank} model_type={model_type} "
                 f"n_expert_specs={len(expert_specs)} n_empty_conversions="
-                f"{len(empty_conversion_specs)} expert_sd_keys={len(expert_sd)} "
+                f"{len(empty_conversion_specs)} n_fallback_conversions="
+                f"{len(fallback_conversion_specs)} expert_sd_keys={len(expert_sd)} "
                 f"n_shards={n_shards} "
                 f"sample_empty={empty_conversion_specs[:3]} "
+                f"sample_fallback={fallback_conversion_specs[:3]} "
                 f"sample_nonempty_keys={list(expert_sd.keys())[:3]}"
+            )
+        if model_type == "qwen3_5_moe" and n_shards > 0 and len(expert_sd) == 0:
+            raise ValueError(
+                "qwen3_5_moe expert export produced no HF weights after mbridge "
+                "conversion and local fallback; check mbridge bridge compatibility "
+                "and expert naming/merging logic."
             )
         # Split the state dict into shards and save the process's own shard.
         shards = split_state_dict_into_shards(expert_sd, n_shards)
