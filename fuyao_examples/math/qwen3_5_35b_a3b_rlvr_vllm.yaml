@@ -67,7 +67,10 @@ rollout:
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   setup_timeout: 1200.0   # 35B MoE startup over NFS takes time
-  max_concurrent_rollouts: 64
+  # Keep concurrent rollouts aligned with one training batch (batch_size × n_samples = 8).
+  # The previous value 64 reserved far more in-flight sequences than this job can consume,
+  # inflating vLLM KV cache and making single-rank OOM more likely.
+  max_concurrent_rollouts: 8
   queue_size: null
   consumer_batch_size: ${train_dataset.batch_size}
   max_head_offpolicyness: 2
@@ -81,11 +84,22 @@ rollout:
 # Reduced n_samples to cut total rollout volume for OOM-free ppo_update.
 # max_new_tokens=2048 aligns with veRL's 35B script.
 gconfig:
-  n_samples: 4            # reduced 8 → 4 to halve rollout volume
+  n_samples: 2            # reduced 8 → 2 to cut rollout volume 4x while keeping batch_size >= DP
   min_new_tokens: 0
   max_new_tokens: 2048
+  max_tokens: 4096        # keep rollout-side prompt+generation budget aligned with vllm.max_model_len
   greedy: false
   temperature: 0.9
+  top_p: 1.0
+  top_k: -1
+
+eval_gconfig:
+  n_samples: 1            # eval only needs one sample per prompt; lowers rollout cost and memory
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  max_tokens: 4096
+  greedy: false
+  temperature: 0.6
   top_p: 1.0
   top_k: -1
 
@@ -146,7 +160,10 @@ actor:
   reward_scaling: 1.0
   reward_bias: 0.0
   kl_ctl: 0.001
-  ppo_n_minibatches: 1
+  # Split PPO update into 4 minibatches (was 2) — v11 hit 75.25/79.25 GB
+  # (94.9%) on ppo_update peak, only ~4 GB headroom. Smaller minibatches
+  # cut activation memory further without changing effective global batch.
+  ppo_n_minibatches: 4
   recompute_logprob: true
   use_decoupled_loss: true
   behave_imp_weight_cap: 2.0
@@ -199,20 +216,27 @@ vllm:
   model: ${actor.path}
   seed: ${seed}
   dtype: ${actor.dtype}
-  max_num_seqs: 64
+  # Align server-side admission with actual rollout demand to shrink KV cache.
+  max_num_seqs: 8
   max_model_len: 4096    # 2048 gen + 2048 prompt headroom
-  gpu_memory_utilization: 0.8
+  # Leave explicit headroom for MoE load imbalance and weight-update transients.
+  # v11 peaked at 94.9% on ppo_update; pull vLLM share down to give actor more.
+  gpu_memory_utilization: 0.68
   enforce_eager: true   # avoids cudagraph compat issues for Qwen3.5
 
 # ── Datasets — dapo_math_17k ──
-# batch_size reduced 8 → 4 (combined with n_samples 8 → 4 this cuts total
-# rollout volume 4x: from 64 → 16 trajectories per iteration). Mitigates
-# OOM during ppo_update without sacrificing training precision.
+# batch_size must stay >= actor DP size (4), because PPOActorController
+# partitions rollout batches across 4 DP groups before compute_logp/ppo_update.
+# We keep batch_size at 4 and reduce n_samples instead, so rollout volume still
+# drops from 64 to 8 trajectories per iteration.
+# max_length keeps prompt filtering aligned with both vLLM max_model_len (4096)
+# and actor/ref max_tokens_per_mb (4096): 2048 prompt + 2048 generation.
 train_dataset:
   batch_size: 4
   shuffle: true
   pin_memory: true
   num_workers: 4
+  max_length: 2048
   path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
   type: dapo_math
 
@@ -220,6 +244,7 @@ valid_dataset:
   batch_size: 4
   pin_memory: true
   num_workers: 4
+  max_length: 2048
   path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
   type: dapo_math
 
