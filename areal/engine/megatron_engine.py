@@ -1484,12 +1484,33 @@ class MegatronEngine(TrainEngine):
 
     @trace_perf("megatron_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        self.logger.info(
+            "Starting disk weight update: version=%s path=%s rank=%s",
+            meta.version,
+            meta.path,
+            dist.get_rank(),
+        )
         fut = Future()
 
         if dist.get_rank() == 0:
+            self.logger.info(
+                "Submitting rollout disk weight update request: version=%s path=%s",
+                meta.version,
+                meta.path,
+            )
             fut = self.rollout_engine.update_weights_from_disk(meta)
 
+        self.logger.info(
+            "Starting _save_model_to_hf for disk weight update: version=%s path=%s",
+            meta.version,
+            meta.path,
+        )
         self._save_model_to_hf(meta.path, self.tokenizer, None)
+        self.logger.info(
+            "_save_model_to_hf completed for disk weight update: version=%s path=%s",
+            meta.version,
+            meta.path,
+        )
         # dist.barrier() are called when _save_model_to_hf finished
 
         if dist.get_rank() == 0:
@@ -1502,10 +1523,29 @@ class MegatronEngine(TrainEngine):
                 update_name, str(datetime.now().timestamp()), keepalive_ttl=120
             )
 
+            self.logger.info(
+                "Waiting for rollout disk weight update request to finish: version=%s path=%s",
+                meta.version,
+                meta.path,
+            )
             fut.result()
+            self.logger.info(
+                "Rollout disk weight update request finished: version=%s path=%s",
+                meta.version,
+                meta.path,
+            )
 
-        current_platform.synchronize()
+        # Note: _save_model_to_hf already synchronizes CUDA stream + cpu_group
+        # barrier at its exit. Avoid a second current_platform.synchronize() here
+        # because it can hang on ghost NCCL ops after rank 0's fut.result().
+        # The cpu_group barrier is pure-CPU (gloo) and serves only to align all
+        # ranks after rank 0 finishes awaiting the vLLM disk load.
         dist.barrier(group=self.cpu_group)
+        self.logger.info(
+            "Disk weight update synchronized across ranks: version=%s path=%s",
+            meta.version,
+            meta.path,
+        )
 
     def _save_model_to_hf(
         self,
@@ -1515,8 +1555,11 @@ class MegatronEngine(TrainEngine):
         base_model_path: str | None = None,
     ) -> None:
         assert self.model is not None, "Model is not initialized."
+        self.logger.info("Ensuring HF save directory exists: path=%s", path)
         os.makedirs(path, exist_ok=True)
+        self.logger.info("HF save directory is ready: path=%s", path)
 
+        self.logger.info("Starting save_weights_to_hf_with_mbridge_fast: path=%s", path)
         save_weights_to_hf_with_mbridge_fast(
             bridge=self.bridge,
             models=self.model,
@@ -1527,15 +1570,19 @@ class MegatronEngine(TrainEngine):
             is_critic=self.config.is_critic,
             fp8_direct_convert=self.fp8_direct_convert,
         )
+        self.logger.info("save_weights_to_hf_with_mbridge_fast completed: path=%s", path)
 
         if dist.get_rank() == 0:
             if tokenizer is not None:
+                self.logger.info("Saving tokenizer alongside HF weights: path=%s", path)
                 tokenizer.save_pretrained(path)
             if processor is not None:
+                self.logger.info("Saving processor alongside HF weights: path=%s", path)
                 processor.save_pretrained(path)
 
         current_platform.synchronize()
         dist.barrier(group=self.cpu_group)
+        self.logger.info("HF save synchronized across ranks: path=%s", path)
 
     def _load_model_from_hf(self, path: str) -> None:
         assert self.model is not None, "Model is not initialized."
@@ -1604,6 +1651,24 @@ class MegatronEngine(TrainEngine):
         min_n_mbs = (
             2 * pp_size if pp_size > 1 else 1
         )  # avoid pipeline bubbles in training
+        requested_n_mbs = max(min_n_mbs, self.config.mb_spec.n_mbs)
+        effective_n_mbs = requested_n_mbs
+        effective_n_mbs_divisor = pp_size
+        local_n_values = input_["attention_mask"].shape[0] // self.config.mb_spec.granularity
+        if local_n_values < requested_n_mbs:
+            # Small per-DP local batches are valid in RL training after controller-side
+            # dispatch. Relax the micro-batch heuristic instead of failing hard when the
+            # preferred 2*pp schedule cannot be formed from the available sequences.
+            effective_n_mbs = max(1, local_n_values)
+            effective_n_mbs_divisor = 1
+            self.logger.warning(
+                "Relaxing forward micro-batch heuristic due to small local batch: "
+                "requested_n_mbs=%s local_n_values=%s granularity=%s pp_size=%s",
+                requested_n_mbs,
+                local_n_values,
+                self.config.mb_spec.granularity,
+                pp_size,
+            )
         # NOTE: self.config.mb_spec.max_tokens_per_mb determines
         # the expected **total** number of tokens per micro-batch **in the forward pass**.
         # The micro batch list splitted here will be splitted to each
@@ -1611,8 +1676,8 @@ class MegatronEngine(TrainEngine):
         # GPU in a forward pass here will be `max_tokens_per_mb / cp_size`.
         mb_spec = MicroBatchSpec.new(
             self.config.mb_spec,
-            n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
-            n_mbs_divisor=pp_size,
+            n_mbs=effective_n_mbs,
+            n_mbs_divisor=effective_n_mbs_divisor,
         )
         mb_list = split_padded_tensor_dict_into_mb_list(
             input_,
