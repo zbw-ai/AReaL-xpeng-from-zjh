@@ -125,7 +125,7 @@ class PPOTrainer:
         )
 
         # Validate config before proceeding with weight initialization
-        self._validate_cfg()
+        self._validate_cfg(train_dataset=train_dataset, valid_dataset=valid_dataset)
 
         self._amend_xccl_weight_update_envvar()
 
@@ -484,7 +484,22 @@ class PPOTrainer:
                     self.critic.get_device_stats().log("ppo critic update")
 
             # pause inference for updating weights, save, and evaluation
+            new_version = global_step + 1
+            versioned_meta = self.weight_update_meta.with_version(new_version)
+            logger.info(
+                "Starting rollout pause before weight update: global_step=%s current_version=%s next_version=%s mode=%s path=%s",
+                global_step,
+                self.actor.get_version(),
+                new_version,
+                self.config.actor.weight_update_mode,
+                versioned_meta.path,
+            )
             self.rollout.pause()
+            logger.info(
+                "Rollout pause completed: global_step=%s next_version=%s",
+                global_step,
+                new_version,
+            )
 
             _t_update_start = _time.perf_counter()
             with (
@@ -496,9 +511,18 @@ class PPOTrainer:
                 ),
             ):
                 # Use versioned path for weight updates
-                new_version = global_step + 1
-                versioned_meta = self.weight_update_meta.with_version(new_version)
+                logger.info(
+                    "Starting actor.update_weights: global_step=%s next_version=%s path=%s",
+                    global_step,
+                    new_version,
+                    versioned_meta.path,
+                )
                 self.actor.update_weights(versioned_meta)
+                logger.info(
+                    "actor.update_weights completed: global_step=%s next_version=%s",
+                    global_step,
+                    new_version,
+                )
 
                 self.actor.set_version(new_version)
                 if self.critic is not None:
@@ -506,6 +530,11 @@ class PPOTrainer:
                 self.rollout.set_version(new_version)
                 if self.eval_rollout is not None:
                     self.eval_rollout.set_version(new_version)
+                logger.info(
+                    "Weight version broadcast completed: global_step=%s version=%s",
+                    global_step,
+                    new_version,
+                )
             _t_update = _time.perf_counter() - _t_update_start
 
             with (
@@ -761,17 +790,7 @@ class PPOTrainer:
                 "Use `python3 train.py scheduler.type=local` instead of "
                 "`python3 -m areal.infra.launcher.local`."
             )
-        # Create a working copy of config
-        config = deepcopy(rollout_config)
-        if is_eval:
-            # NOTE: eval does not have any offpolicyness control
-            config.max_head_offpolicyness = int(1e12)
-            # eval-rollout uses the same inference servers as rollout
-            config.scheduling_strategy = SchedulingStrategy(
-                type=SchedulingStrategyType.colocation, target="rollout"
-            )
-            for spec in config.scheduling_spec:
-                spec.gpu = 0
+        config = self._prepare_rollout_config(rollout_config, is_eval=is_eval)
 
         # Determine engine class and server args based on backend
         rollout_backend = self.rollout_alloc.backend
@@ -830,6 +849,34 @@ class PPOTrainer:
         controller.initialize(**init_kwargs)
         return controller
 
+    def _prepare_rollout_config(
+        self,
+        rollout_config: InferenceEngineConfig,
+        *,
+        is_eval: bool,
+    ) -> InferenceEngineConfig:
+        """Return a rollout config copy adjusted for train or eval usage.
+
+        Evaluation should reuse the already-running rollout servers instead of
+        forking another colocated worker process per rank. Forking duplicates
+        heavyweight vLLM subprocesses on the same GPUs and can push the first
+        colocated node over the memory limit before any training step begins.
+        """
+        config = deepcopy(rollout_config)
+        if is_eval:
+            # NOTE: eval does not have any offpolicyness control.
+            config.max_head_offpolicyness = int(1e12)
+            # Reuse rollout workers and connect a lightweight eval engine to the
+            # existing local inference servers instead of forking new workers.
+            config.scheduling_strategy = SchedulingStrategy(
+                type=SchedulingStrategyType.colocation,
+                target="rollout",
+                fork=False,
+            )
+            for spec in config.scheduling_spec:
+                spec.gpu = 0
+        return config
+
     def _save_initial_lora_weights(self) -> str | None:
         """Save initial LoRA weights for inference server pre-loading.
 
@@ -882,9 +929,13 @@ class PPOTrainer:
                 name="critic",
             )
         # Async mode: synchronization handled by AsyncCheckpointManager
+        # Note: current_platform.synchronize() after barrier is intentionally
+        # omitted — it can hang on ghost NCCL ops in default_pg after disk
+        # weight updates (observed on Qwen3.5-35B VL + EP). The gloo cpu_group
+        # barrier is sufficient for cross-rank coordination; GPU work will be
+        # implicitly awaited by the next CUDA op.
         if not self.saver.is_async:
             dist.barrier(group=self.actor.cpu_group)
-            current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
         # Save recoverable checkpoints
@@ -908,8 +959,8 @@ class PPOTrainer:
             processor=self.processor,
         )
 
+        # See _save_hf note: skip current_platform.synchronize() after barrier.
         dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
 
     def _evaluate_fn(
         self,
@@ -930,8 +981,8 @@ class PPOTrainer:
                     cnt += 1
             self.eval_rollout.wait(cnt, timeout=None)
 
+        # See _save_hf note: skip current_platform.synchronize() after barrier.
         dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
 
     def _evaluate(
         self,
@@ -957,8 +1008,8 @@ class PPOTrainer:
             epoch_step,
             global_step,
         )
+        # See _save_hf note: skip current_platform.synchronize() after barrier.
         dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
 
     def _export_and_commit_stats(
         self,
@@ -1023,16 +1074,153 @@ class PPOTrainer:
 
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
+        # See _save_hf note: skip current_platform.synchronize() after barrier.
         dist.barrier(group=self.actor.cpu_group)
-        current_platform.synchronize()
 
-    def _validate_cfg(self):
+    def _validate_cfg(
+        self,
+        train_dataset: Dataset | None = None,
+        valid_dataset: Dataset | None = None,
+    ):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         if rollout_backend == "vllm" and self.config.rollout.return_routed_experts:
             raise ValueError(
                 "return_routed_experts is only supported with SGLang backend. "
                 "Please disable return_routed_experts or switch to SGLang backend."
+            )
+
+        actor_dp_size = self.actor_alloc.parallel.dp_size
+        actor_pp_size = max(1, self.actor_alloc.parallel.pp_size)
+        recommended_forward_n_mbs = 2 * actor_pp_size if actor_pp_size > 1 else 1
+        vllm_max_model_len = self.config.vllm.max_model_len
+
+        def _validate_prompt_budget(
+            dataset_name: str,
+            dataset_cfg: TrainDatasetConfig | ValidDatasetConfig,
+            gconfig,
+        ) -> None:
+            if dataset_cfg.max_length is None:
+                logger.warning(
+                    "%s.max_length is unset; prompt lengths are not filtered before rollout. "
+                    "For vLLM max_model_len=%s and max_new_tokens=%s, setting max_length "
+                    "helps fail early on overlong prompts.",
+                    dataset_name,
+                    vllm_max_model_len,
+                    gconfig.max_new_tokens,
+                )
+                return
+
+            prompt_budget = gconfig.max_tokens - gconfig.max_new_tokens
+            if vllm_max_model_len is not None:
+                prompt_budget = min(
+                    prompt_budget,
+                    vllm_max_model_len - gconfig.max_new_tokens,
+                )
+            if prompt_budget <= 0:
+                raise ValueError(
+                    f"{dataset_name} prompt budget is non-positive. "
+                    f"Got gconfig.max_tokens={gconfig.max_tokens}, "
+                    f"gconfig.max_new_tokens={gconfig.max_new_tokens}, "
+                    f"vllm.max_model_len={vllm_max_model_len}."
+                )
+            if dataset_cfg.max_length > prompt_budget:
+                raise ValueError(
+                    f"{dataset_name}.max_length ({dataset_cfg.max_length}) exceeds the "
+                    f"safe prompt budget ({prompt_budget}) derived from "
+                    f"gconfig.max_tokens={gconfig.max_tokens}, "
+                    f"gconfig.max_new_tokens={gconfig.max_new_tokens}, "
+                    f"vllm.max_model_len={vllm_max_model_len}. "
+                    "Reduce dataset max_length or increase the aligned rollout context limit."
+                )
+
+        def _validate_forward_capacity(
+            dataset_name: str,
+            dataset_cfg: TrainDatasetConfig,
+            gconfig,
+        ) -> None:
+            if dataset_cfg.max_length is None:
+                logger.warning(
+                    "Skipping forward capacity validation for %s because max_length is unset. "
+                    "actor/ref max_tokens_per_mb must cover prompt_len + max_new_tokens at runtime.",
+                    dataset_name,
+                )
+                return
+
+            required_tokens = dataset_cfg.max_length + gconfig.max_new_tokens
+            actor_capacity = self.config.actor.mb_spec.max_tokens_per_mb
+            if actor_capacity is not None and actor_capacity < required_tokens:
+                raise ValueError(
+                    "actor.mb_spec.max_tokens_per_mb is too small for the filtered prompt budget. "
+                    f"Need at least {required_tokens} (= {dataset_cfg.max_length} prompt + "
+                    f"{gconfig.max_new_tokens} generated), got {actor_capacity}."
+                )
+            if self.config.ref is not None:
+                ref_capacity = self.config.ref.mb_spec.max_tokens_per_mb
+                if ref_capacity is not None and ref_capacity < required_tokens:
+                    raise ValueError(
+                        "ref.mb_spec.max_tokens_per_mb is too small for the filtered prompt budget. "
+                        f"Need at least {required_tokens} (= {dataset_cfg.max_length} prompt + "
+                        f"{gconfig.max_new_tokens} generated), got {ref_capacity}."
+                    )
+
+        if (
+            rollout_backend == "vllm"
+            and vllm_max_model_len is not None
+            and self.config.gconfig.max_tokens > vllm_max_model_len
+        ):
+            logger.warning(
+                "gconfig.max_tokens (%s) exceeds vllm.max_model_len (%s). "
+                "Rollout will still be bounded by vLLM. Keeping these aligned avoids "
+                "overlong-prompt surprises during generation.",
+                self.config.gconfig.max_tokens,
+                vllm_max_model_len,
+            )
+
+        if train_dataset is not None:
+            train_batch_size = self.config.train_dataset.batch_size
+            if train_batch_size < actor_dp_size or train_batch_size % actor_dp_size != 0:
+                raise ValueError(
+                    "train_dataset.batch_size must be >= and divisible by actor data parallel size "
+                    f"for PPO dispatch. Got batch_size={train_batch_size}, actor_dp_size={actor_dp_size}. "
+                    "Reduce rollout volume with gconfig.n_samples / max_new_tokens / ppo_n_minibatches "
+                    "instead of setting batch_size below DP size."
+                )
+            _validate_prompt_budget(
+                "train_dataset",
+                self.config.train_dataset,
+                self.config.gconfig,
+            )
+            _validate_forward_capacity(
+                "train_dataset",
+                self.config.train_dataset,
+                self.config.gconfig,
+            )
+            local_forward_batch = (
+                train_batch_size // actor_dp_size
+            ) * self.config.gconfig.n_samples
+            if local_forward_batch < recommended_forward_n_mbs:
+                logger.warning(
+                    "Per-DP local forward batch (%s) is smaller than the pipeline-friendly "
+                    "recommendation (%s = 2 * pp_size). Training can still proceed because "
+                    "Megatron forward micro-batching will be relaxed automatically, but expect "
+                    "lower pipeline efficiency. Increase train_dataset.batch_size or gconfig.n_samples "
+                    "if you want to avoid this fallback.",
+                    local_forward_batch,
+                    recommended_forward_n_mbs,
+                )
+
+        if valid_dataset is not None and self.config.valid_dataset is not None:
+            valid_batch_size = self.config.valid_dataset.batch_size
+            if valid_batch_size < actor_dp_size or valid_batch_size % actor_dp_size != 0:
+                raise ValueError(
+                    "valid_dataset.batch_size must be >= and divisible by actor data parallel size "
+                    f"for PPO dispatch. Got batch_size={valid_batch_size}, actor_dp_size={actor_dp_size}."
+                )
+            _validate_prompt_budget(
+                "valid_dataset",
+                self.config.valid_dataset,
+                self.config.eval_gconfig,
             )
 
     def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:
