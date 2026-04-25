@@ -132,6 +132,40 @@ HEAD_ADDR="${MASTER_ADDR:-localhost}"
 GPUS_PER_NODE="${SLURM_GPUS_PER_NODE:-8}"
 RAY_PORT=6379
 
+CONFIG_CLUSTER_NODES="$(python3 - "$CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+cluster = cfg.get("cluster", {}) or {}
+print(cluster.get("n_nodes", ""))
+PY
+)"
+CONFIG_CLUSTER_GPUS_PER_NODE="$(python3 - "$CONFIG_PATH" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f) or {}
+cluster = cfg.get("cluster", {}) or {}
+print(cluster.get("n_gpus_per_node", ""))
+PY
+)"
+
+if [[ -n "${SLURM_JOB_NUM_NODES:-}" ]] && [[ -n "${CONFIG_CLUSTER_NODES}" ]] && [[ "${SLURM_JOB_NUM_NODES}" != "${CONFIG_CLUSTER_NODES}" ]]; then
+    echo "Error: Fuyao allocated ${SLURM_JOB_NUM_NODES} nodes, but config expects ${CONFIG_CLUSTER_NODES}."
+    echo "Resource allocation is determined by Fuyao deploy arguments, not only by YAML."
+    echo "Please redeploy with matching --node_count."
+    exit 1
+fi
+
+if [[ -n "${SLURM_GPUS_PER_NODE:-}" ]] && [[ -n "${CONFIG_CLUSTER_GPUS_PER_NODE}" ]] && [[ "${SLURM_GPUS_PER_NODE}" != "${CONFIG_CLUSTER_GPUS_PER_NODE}" ]]; then
+    echo "Error: Fuyao allocated ${SLURM_GPUS_PER_NODE} GPUs/node, but config expects ${CONFIG_CLUSTER_GPUS_PER_NODE}."
+    echo "Please redeploy with matching --gpus_per_node."
+    exit 1
+fi
+
 echo "Node rank: ${NODE_RANK}, Total nodes: ${NUM_NODES}, Head addr: ${HEAD_ADDR}, GPUs/node: ${GPUS_PER_NODE}"
 
 # NCCL 配置
@@ -142,6 +176,16 @@ export NCCL_IB_HCA=mlx5
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_CUMEM_ENABLE=0
 export NCCL_MAX_NCHANNELS=16
+
+# Debug ghost NCCL op on default_pg observed across v10/v13/v14:
+# - Flight recorder dumps stack trace of pending collectives on timeout
+# - Desync debug prints rank-by-rank work counts to identify mismatch
+# - Trace cpp stack on watchdog fire
+# - 5 min watchdog timeout (vs 2h default) so we don't waste a job to find it
+export TORCH_NCCL_TRACE_BUFFER_SIZE=20000
+export TORCH_NCCL_DESYNC_DEBUG=1
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=300
 
 # CUDA 配置
 export CUDA_DEVICE_MAX_CONNECTIONS="1"
