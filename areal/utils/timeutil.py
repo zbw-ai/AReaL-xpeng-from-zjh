@@ -22,6 +22,7 @@ class FrequencyControl:
         frequency_steps: int | None = None,
         initial_value: bool = False,
         group: dist.ProcessGroup | None = None,
+        disable_dist_sync: bool = False,
     ):
         """Initialization method of FrequencyControl.
         Args:
@@ -41,6 +42,7 @@ class FrequencyControl:
         self.frequency_seconds = frequency_seconds
         self.frequency_steps = frequency_steps
         self.group = group
+        self.disable_dist_sync = disable_dist_sync
         self.__start_time = datetime.now()
         self.__steps = 0
         self.__last_time = datetime.now()
@@ -113,7 +115,12 @@ class FrequencyControl:
             if self.frequency_steps is None and self.frequency_seconds is None:
                 return False
             if self.frequency_seconds is not None:
-                if dist.is_initialized():
+                # disable_dist_sync=True is used by callers that run only on a
+                # subset of ranks (e.g. the rank-0-only keepalive thread in
+                # name_resolve). Using a global all_reduce there would enqueue
+                # a ghost NCCL op that no other rank ever matches, eventually
+                # deadlocking subsequent collectives on default_pg.
+                if dist.is_initialized() and not self.disable_dist_sync:
                     interval_seconds = torch.tensor(
                         self.__interval_seconds, device=current_platform.device_type
                     )
@@ -121,6 +128,8 @@ class FrequencyControl:
                         interval_seconds, op=dist.ReduceOp.MAX, group=self.group
                     )
                     self.__interval_seconds = interval_seconds.item()
+                else:
+                    interval_seconds = self.__interval_seconds
                 # We pass time check if the interval second in any process
                 # is larger than self.frequency_seconds.
                 if interval_seconds < self.frequency_seconds:
