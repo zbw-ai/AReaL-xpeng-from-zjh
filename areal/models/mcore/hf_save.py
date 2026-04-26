@@ -271,6 +271,15 @@ def save_weights_to_hf_with_mbridge_fast(
     is_critic: bool = False,
     fp8_direct_convert: bool = False,
 ):
+    # 0. Reset mbridge's per-call buffers. The qwen3_5 bridge accumulates
+    # expert weights into self.export_weights_buff[experts_key][experts_idx]
+    # and asserts on duplicate index. Without resetting, the second
+    # update_weights() invocation crashes with AssertionError on every rank.
+    for buf_name in ("export_weights_buff", "_export_weights_buff"):
+        buf = getattr(bridge, buf_name, None)
+        if isinstance(buf, dict):
+            buf.clear()
+
     # 1. Prepare some global metadata required for saving the model.
     models = [unwrap_model(model) for model in models]
     pp_size = mpu.get_pipeline_model_parallel_world_size()
