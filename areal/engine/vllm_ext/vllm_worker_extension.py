@@ -1,7 +1,10 @@
+import os
 import traceback
+from glob import glob
 
 import torch
 import torch.distributed as dist
+from safetensors import safe_open
 from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
@@ -13,6 +16,30 @@ from areal.infra.platforms import current_platform
 from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 
 logger = init_logger("vllm_worker_extension")
+
+
+def _summarize_checkpoint_keys(model_path: str, limit: int = 12) -> str:
+    shard_paths = sorted(glob(os.path.join(model_path, "*.safetensors")))
+    if not shard_paths:
+        return f"no safetensors shards found under {model_path}"
+
+    sampled_keys: list[str] = []
+    sampled_expert_keys: list[str] = []
+    for shard_path in shard_paths[: min(3, len(shard_paths))]:
+        with safe_open(shard_path, framework="pt") as f:
+            keys = list(f.keys())
+        sampled_keys.extend(keys[:limit])
+        sampled_expert_keys.extend([k for k in keys if ".mlp.experts." in k][:limit])
+        if len(sampled_keys) >= limit and len(sampled_expert_keys) >= limit:
+            break
+
+    sampled_keys = sampled_keys[:limit]
+    sampled_expert_keys = sampled_expert_keys[:limit]
+    return (
+        f"sample_keys={sampled_keys}; "
+        f"sample_expert_keys={sampled_expert_keys}; "
+        f"n_shards={len(shard_paths)}"
+    )
 
 
 class VLLMWorkerExtension:
@@ -40,6 +67,16 @@ class VLLMWorkerExtension:
         except Exception as e:
             error_msg = f"failed to upload weights! {e}"
             logger.error(error_msg)
+            try:
+                logger.error(
+                    "checkpoint key summary before upload failure: %s",
+                    _summarize_checkpoint_keys(model_path),
+                )
+            except Exception as summary_error:
+                logger.error(
+                    "failed to summarize checkpoint keys after upload failure: %s",
+                    summary_error,
+                )
             return False, error_msg
 
     def areal_update_weights_lora(
@@ -127,6 +164,20 @@ class VLLMWorkerExtension:
             raise KeyError(
                 f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
             )
+        # ── DEBUG (Qwen3.5 q||gate xccl investigation) ──
+        # We're trying to determine why load_weights() rejects q_proj shape under
+        # xccl mode. Log every tensor's (name, dtype, shape) and pinpoint which
+        # one fails. Single-tensor load_weights() may not satisfy vLLM's fused
+        # weight loader (q_proj+attn_gate, gate_up_proj, qkv_proj) — this debug
+        # helps confirm whether the issue is a single q_proj shape mismatch or
+        # a fused-loader contract violation across multiple calls.
+        logger.info(
+            f"[xccl debug] received meta for {len(names)} tensors, "
+            f"first 5 names: {list(names[:5])}, last 5 names: {list(names[-5:])}",
+            flush=True,
+        )
+        attempted = 0
+        last_ok_name = None
         try:
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
@@ -141,11 +192,38 @@ class VLLMWorkerExtension:
                     group=group,
                     async_op=False,
                 )
-                self.model_runner.model.load_weights(weights=[(name, tensor)])
+                # Log every tensor we're about to feed into vLLM's load_weights.
+                # On 0.8B this is hundreds of tensors; on 35B-A3B it's 30k+.
+                # Use info level so it survives default log filters.
+                logger.info(
+                    f"[xccl debug] #{attempted} loading name={name!r} "
+                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype}",
+                    flush=True,
+                )
+                try:
+                    self.model_runner.model.load_weights(weights=[(name, tensor)])
+                except Exception as inner:
+                    logger.error(
+                        f"[xccl debug] load_weights FAILED at #{attempted} "
+                        f"name={name!r} shape={tuple(tensor.shape)} "
+                        f"dtype={tensor.dtype}: {type(inner).__name__}: {inner}\n"
+                        f"  last successfully loaded tensor: {last_ok_name!r}",
+                        flush=True,
+                    )
+                    raise
+                last_ok_name = name
+                attempted += 1
+            logger.info(
+                f"[xccl debug] all {attempted} tensors loaded successfully",
+                flush=True,
+            )
             self.sync()
             return True, "Success"
         except Exception as e:
-            error_msg = f"Failed to update parameter! {e}."
+            error_msg = (
+                f"Failed to update parameter! {e}. "
+                f"(attempted={attempted}, last_ok={last_ok_name!r})"
+            )
             logger.error(error_msg)
             return False, error_msg
 

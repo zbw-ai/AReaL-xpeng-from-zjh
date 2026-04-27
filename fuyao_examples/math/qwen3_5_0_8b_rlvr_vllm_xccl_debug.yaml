@@ -1,0 +1,249 @@
+# Qwen3.5-0.8B Math RLVR — XCCL DEBUG variant
+#
+# 目的: 抓 vLLM xccl 路径下的 q_proj shape mismatch (Qwen3.5 q||gate fused
+# attention)。基于 qwen3_5_0_8b_rlvr_vllm.yaml, 只改一项:
+#   weight_update_mode: disk → xccl
+#
+# 配套改动: areal/engine/vllm_ext/vllm_worker_extension.py 的
+#   areal_update_weight_xccl 加了 [xccl debug] log, 会输出每个 tensor 的
+#   (name, dtype, shape), 失败时告知是第几个 tensor、上一个成功 load 的是什么。
+#
+# 跑出 log 后定位到具体 tensor (期望是 q_proj 或 gate_up_proj), 再决定:
+#   方案 A: 改 vllm_worker_extension.py 把 single-tensor load_weights 改成
+#           batch (一次 push 一个 layer 的所有 attention 参数, 让 vLLM 的
+#           fused weight loader 能合并 q+gate)
+#   方案 B: 在 _mbridge_convert_to_hf 里把 fused q||gate 拆成独立 tensor 再 push
+#
+# 原始 0.8B config 的注释:
+#   Purpose: validate pad_to_maximum + TP seq alignment code paths before 35B run.
+#   Same code path as 35B (mbridge + Megatron bshd + vLLM), but small model
+#   and single node → 2-5 min init vs 10-20 min for 35B.
+#
+# GPU layout (1 node × 8 GPU):
+#   Actor  (4 GPU): megatron:d2p1t2 — TP=2
+#   vLLM   (4 GPU): vllm:d4t1      — TP=1 (one 0.8B per GPU, 4 DP replicas)
+#   Ref: colocated with actor
+#
+# CRITICAL CONSTRAINTS (Qwen3.5-0.8B has num_key_value_heads=2, num_q_heads=8):
+# - Actor TP must be ≤ num_kv_heads to avoid Megatron's num_query_groups
+#   bump in get_query_key_value_tensors (caused _apply_output_gate 2× bug).
+# - vLLM TP must be ≤ num_kv_heads too — with TP > num_kv_heads vLLM
+#   replicates KV but GQA weight-update shape check fails (dim 2 mismatch
+#   when Megatron-exported tensor is scattered). Use TP=1 for simplicity.
+#
+# NOTE: Keep pad_to_maximum=true — same GDN bshd requirement as 35B
+#
+# Usage:
+#   bash fuyao_examples/fuyao_areal_run.sh \
+#       --run-type math_rlvr \
+#       --config fuyao_examples/math/qwen3_5_0_8b_rlvr_vllm.yaml
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-0_8b-math-rlvr
+trial_name: trial0
+
+seed: 42
+enable_offload: false
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+# ── Rollout (Inference) — vLLM TP1 × DP4 = 4 GPU ──
+rollout:
+  backend: "vllm:d4t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 600.0
+  max_concurrent_rollouts: 16
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config — smaller for faster validation ──
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  greedy: false
+  temperature: 0.9
+  top_p: 1.0
+  top_k: -1
+
+# ── Actor (Training) — Megatron TP=4: 4 GPU ──
+# Exercises TP seq alignment fix (align_to = tp_size * cp_size * 2 if cp>1 else tp_size = 4)
+actor:
+  backend: "megatron:d2p1t2"  # TP=2: num_kv_heads=2 forbids TP>2 (see GPU layout note)
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3.5-0.8B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
+  pad_to_maximum: true   # REQUIRED: Qwen3.5 GDN requires bshd format
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  # XCCL DEBUG: 把 weight_update_mode 临时切到 xccl 来抓 q_proj shape mismatch
+  # 的具体调用栈。配合 vllm_worker_extension.py:areal_update_weight_xccl 里的
+  # debug log, 能定位是哪个 tensor 失败、shape 是什么。
+  # 跑通后改回 disk 或确认 xccl 修复后保留为 xccl。
+  # 原 (disk) 模式日志: mbridge 的 q||gate concat 让 vLLM qwen3_5 loader 报
+  # "expanded 4 must match 8 at dim 2"。
+  weight_update_mode: xccl
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — Megatron colocated with actor ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
+  pad_to_maximum: true   # REQUIRED: same as actor — Qwen3.5 GDN forbids THD path
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── vLLM ──
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  dtype: ${actor.dtype}
+  max_num_seqs: 16
+  max_model_len: 4096
+  gpu_memory_utilization: 0.8
+  enforce_eager: true
+
+# ── Datasets — dapo_math_17k ──
+train_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
