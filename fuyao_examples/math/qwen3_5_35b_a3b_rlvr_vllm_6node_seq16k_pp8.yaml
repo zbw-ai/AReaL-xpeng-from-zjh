@@ -16,25 +16,38 @@
 # linear 增长。预期 actor 40-50 GB, 留足 ref + compute_logp activation。
 #
 # 与 v22 (PP=4) 差异 (只动并行布局):
-#   backend: d4p4t2 → d2p8t2  (DP=4→2, PP=4→8)
+#   backend: (attn:d4p4t2|ffn:e8t1) → (attn:d2p8t2|ffn:e4t1)
+#     DP=4→2, PP=4→8, EP=8→4 (PP=8 必须降 EP, 不然 ffn ep*tp*pp 超 actor 32 GPU)
 #   ppo_n_minibatches: 32 → 64  (256/64 = 4/mb ÷ DP=2 = 2/rank, 与 v18-v21 同)
 #   ref backend: 跟 actor 同步切 (引用 actor.backend)
+#
+# 首次提交错误纠正:
+#   v22-pp8-r1 (bifrost-2026042717413600): ffn:e8t1 错误, 32 attn world ÷ 64 ffn ep*tp*pp 失败
+#   修复: ffn:e8t1 → ffn:e4t1, 让 ep*tp*pp = 32 整除 attn world
 #
 # 集群约束验证:
 #   actor 32 GPU: DP=2 × PP=8 × TP=2 = 32 ✓
 #   layers 40 / PP=8 = 5 layer/rank ✓ 整除 (干净分布)
-#   experts: EP=8, ETP=1 不变, 整除 OK
+#   experts (修正): PP=8 时 ffn ep*tp*pp 不能再用 e8t1 (8*1*8=64 > 32 GPU)
+#     改 EP=8 → EP=4: ffn 4*1*8=32 ✓, expert_dp = 32/32 = 1
+#     代价: 每 rank 持有 experts × 2 (32 vs 16/rank), 但 PP=8 已折半 layer params
 #   batch=32 × n=8 = 256 samples ÷ DP=2 = 128/dp head
 #   ppo_n_minibatches=64: 256/64 = 4 sample/minibatch ÷ DP=2 = 2 sample/rank
 #     与 v18/v20/v21 (PP=4, ppo_n_minibatches=32) 的 2/rank 完全一致
 #
-# 显存预估 (基于 v22 实测 + PP=8 折半):
-#   actor params/optim/rank: ~9.35/2 = 4.7 GB     (PP=8 切半)
-#   activation/rank:          ~30/2 = 15 GB        (PP=8 切半)
-#   ref onload:                8.61 GB (不变, 跟 actor colocate 同处理)
-#   compute_logp peak:         ~7-10 GB (单 stage activation)
-#   预期 actor:                40-50 GB / 80 GB (50-63%)
-#   头空间:                    ~30 GB ✓
+# 显存预估 (基于 v22 实测 + PP=8 折半 + EP=4 翻倍):
+#   actor params/optim/rank:
+#     PP=4 EP=8 (v22): ~9.35 GB
+#     PP=8 EP=4:       PP /2 → 4.7,  EP /2 → 实际不变, 全部 expert/rank * 2 = 9.4 GB
+#                     → 净 params 与 v22 持平 (PP win 被 EP loss 抵消)
+#   activation/rank:          PP=8 切半, ~30 GB → ~15 GB (相比 v22 -15 GB)
+#   compute_logp peak:        ~15.3/2 = 7.6 GB (PP=8 切半)
+#   ref onload:                8.61 GB (不变)
+#   MoE alltoall buffer:       EP=4 时每 dispatcher 处理 2× experts, 但 token 数不变,
+#                              缓冲总量与 EP=8 大致持平 (alltoall 是 token-bound)
+#   预期 actor train peak:     35-45 GB / 80 GB (44-56%)
+#   预期 compute_logp peak:    9.4 + 8.61 + 7.6 = ~25 GB ✓ (远离 80 GB)
+#   头空间:                    ~35-45 GB ✓
 #
 # 不变:
 #   batch_size: 32, n_samples: 8, total samples 256
@@ -49,7 +62,7 @@
 #   4. 加节点到 8/9 (PP=8 + DP=4)
 #
 # GPU layout (与 v17 完全等价, 仅 actor 内部并行布局变):
-#   Actor (32 GPU): megatron:(attn:d2p8t2|ffn:e8t1)  ← 改这里
+#   Actor (32 GPU): megatron:(attn:d2p8t2|ffn:e4t1)  ← PP=4→8, EP=8→4
 #   vLLM  (16 GPU): vllm:d8t2 (不变)
 #   Ref: colocated with actor (backend 跟 actor 同步切)
 
@@ -112,7 +125,7 @@ eval_gconfig:
 
 # ── Actor (Training) — 与 v17 同布局; PPO 超参对齐 8B ──
 actor:
-  backend: "megatron:(attn:d2p8t2|ffn:e8t1)"   # v22-pp8: PP=4→8, DP=4→2 (回退 OOM)
+  backend: "megatron:(attn:d2p8t2|ffn:e4t1)"   # v22-pp8: PP=4→8, DP=4→2, EP=8→4 (PP=8 强制降 EP)
   experiment_name: ${experiment_name}
   trial_name: ${trial_name}
   path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
