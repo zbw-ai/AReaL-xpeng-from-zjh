@@ -154,7 +154,11 @@ class VLLMWorkerExtension:
         return True, "Success"
 
     def areal_update_weight_xccl(self):
-        logger.info("start update weights by nccl or hccl", flush=True)
+        # NOTE: logger here is a logging.Logger from vllm.logger.init_logger.
+        # Don't pass flush=True (that's a print() kwarg) — it raises
+        # TypeError: Logger._log() got an unexpected keyword argument 'flush'
+        # which gets caught by the outer try/except and masks the real error.
+        logger.info("start update weights by nccl or hccl")
         names = self.areal_weight_meta_names
         dtypes = self.areal_weight_meta_dtypes
         shapes = self.areal_weight_meta_shapes
@@ -165,16 +169,15 @@ class VLLMWorkerExtension:
                 f"Weight update group named `{self.areal_weight_meta_group_name}` not found"
             )
         # ── DEBUG (Qwen3.5 q||gate xccl investigation) ──
-        # We're trying to determine why load_weights() rejects q_proj shape under
-        # xccl mode. Log every tensor's (name, dtype, shape) and pinpoint which
-        # one fails. Single-tensor load_weights() may not satisfy vLLM's fused
-        # weight loader (q_proj+attn_gate, gate_up_proj, qkv_proj) — this debug
-        # helps confirm whether the issue is a single q_proj shape mismatch or
-        # a fused-loader contract violation across multiple calls.
+        # Log every tensor's (name, dtype, shape) before load_weights, and on
+        # failure report which tensor + shape triggered it. This isolates
+        # whether the issue is a single q_proj shape mismatch or a fused-loader
+        # contract violation across single-tensor load_weights() calls.
         logger.info(
-            f"[xccl debug] received meta for {len(names)} tensors, "
-            f"first 5 names: {list(names[:5])}, last 5 names: {list(names[-5:])}",
-            flush=True,
+            "[xccl debug] received meta for %d tensors, first 5 names: %s, last 5 names: %s",
+            len(names),
+            list(names[:5]),
+            list(names[-5:]),
         )
         attempted = 0
         last_ok_name = None
@@ -193,29 +196,34 @@ class VLLMWorkerExtension:
                     async_op=False,
                 )
                 # Log every tensor we're about to feed into vLLM's load_weights.
-                # On 0.8B this is hundreds of tensors; on 35B-A3B it's 30k+.
-                # Use info level so it survives default log filters.
+                # On 0.8B this is hundreds; on 35B-A3B it's 30k+. Info level so
+                # it survives default filters.
                 logger.info(
-                    f"[xccl debug] #{attempted} loading name={name!r} "
-                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype}",
-                    flush=True,
+                    "[xccl debug] #%d loading name=%r shape=%s dtype=%s",
+                    attempted,
+                    name,
+                    tuple(tensor.shape),
+                    tensor.dtype,
                 )
                 try:
                     self.model_runner.model.load_weights(weights=[(name, tensor)])
                 except Exception as inner:
                     logger.error(
-                        f"[xccl debug] load_weights FAILED at #{attempted} "
-                        f"name={name!r} shape={tuple(tensor.shape)} "
-                        f"dtype={tensor.dtype}: {type(inner).__name__}: {inner}\n"
-                        f"  last successfully loaded tensor: {last_ok_name!r}",
-                        flush=True,
+                        "[xccl debug] load_weights FAILED at #%d name=%r shape=%s "
+                        "dtype=%s: %s: %s\n  last successfully loaded tensor: %r",
+                        attempted,
+                        name,
+                        tuple(tensor.shape),
+                        tensor.dtype,
+                        type(inner).__name__,
+                        inner,
+                        last_ok_name,
                     )
                     raise
                 last_ok_name = name
                 attempted += 1
             logger.info(
-                f"[xccl debug] all {attempted} tensors loaded successfully",
-                flush=True,
+                "[xccl debug] all %d tensors loaded successfully", attempted
             )
             self.sync()
             return True, "Success"
