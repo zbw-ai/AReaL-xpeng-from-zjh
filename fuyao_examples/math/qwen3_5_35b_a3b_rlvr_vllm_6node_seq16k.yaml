@@ -1,0 +1,277 @@
+# Qwen3.5-35B-A3B Math RLVR — 6-node, batch=32 + seq=16K (v22)
+#
+# 基于 v21 (8K seq) 实测数据继续推进。v21 显存几乎与 v20 (2K seq) 完全一致,
+# 颠覆了专家原本"MoE dispatch buffer 随 token 线性增长"的判断 — 4K seq 下
+# MoE alltoall buffer 涨幅可忽略, 这给 16K @ PP=4 留下了信心。
+#
+# v21 实测 (bifrost-2026042715145701-zengbw1):
+#   actor (worker-1/2/3/4): ~40-41 GiB device used
+#   vLLM  (worker-0):       ~55.5 GiB device used
+#   增长 vs v20:            actor +1 GB, vLLM -0.5 GB (max_num_seqs 减半补偿)
+#
+# 决策: 保持 PP=4 不切 PP=8, 直接 8K → 16K, 节省 PP=8 配置带来的不确定性。
+# 如果 v22 OOM, 再回退到 PP=8 路径 (DP=2)。
+#
+# 与 v21 差异 (只动 seq + vLLM 调度):
+#   max_new_tokens:           4096  → 16384    (gen 长度 4×, 直接到 16K)
+#   max_tokens (gen+prompt):  8192  → 18432    (16K gen + 2K prompt)
+#   max_tokens_per_mb:        8192  → 18432    (单 18K seq/microbatch, BSHD)
+#   vllm.max_model_len:       8192  → 18432    (≥ max_tokens)
+#   vllm.max_num_seqs:        128   → 32       (KV cache per seq 4× → 总量持平)
+#   rollout.max_concurrent_rollouts: 128 → 32  (跟 vllm.max_num_seqs)
+#   train/valid_dataset.max_length: 4096 → 2048(prompt 上限收回, 8B 也是 1024)
+#
+# 不变:
+#   batch_size: 32, n_samples: 8 (256 samples/step)
+#   ppo_n_minibatches: 32
+#   backend: megatron:(attn:d4p4t2|ffn:e8t1) (PP=4 不变!)
+#
+# 显存预估 (基于 v21 实测斜率):
+#   v21 actor 41 GB, seq 4K → 8K 几乎不涨 (~+1 GB)
+#   v22 actor 估计:  ~45-55 GB (16K = 4× v21 token, 但 EP=8 alltoall sublinear)
+#                    上限场景 (alltoall 系数转 linear): ~60 GB, 仍有 ~20 GB headroom
+#   v22 vLLM 估计:  ~55 GB (持平, KV cache 减半补偿 seq 翻倍)
+#
+# OOM 回退方案 (按风险递增):
+#   1. vllm.max_num_seqs: 32 → 16 (KV cache -50%, 进一步给 KV 留余量)
+#   2. backend → megatron:(attn:d2p8t2|ffn:e8t1) (PP=8 + DP=2, ppo_n_minibatches=64)
+#   3. 加节点到 8/9 (actor+vLLM 重新分配)
+#
+# 32K (v23) 路径仍待 v22 实测后确定。如 v22 actor < 50 GB, 32K @ PP=4 可能也行;
+# 如 50-60 GB, 32K 必须切 PP=8 或加节点。
+#
+# GPU layout (与 v17/v20/v21 完全一致):
+#   Actor (32 GPU): megatron:(attn:d4p4t2|ffn:e8t1)
+#   vLLM  (16 GPU): vllm:d8t2
+#   Ref: colocated with actor
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-seq16k
+trial_name: trial0
+
+seed: 42
+enable_offload: true   # 35B colocate 必需
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 6
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+# ── Rollout (Inference) ──
+rollout:
+  backend: "vllm:d8t2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 1200.0
+  # v22: 128 → 32, KV cache per seq 4× (16K vs 4K), 总量持平 v21
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config — 采样参数对齐 8B benchmark ──
+gconfig:
+  n_samples: 8                # 2 → 8, GRPO 标准, 对齐 8B
+  min_new_tokens: 0
+  max_new_tokens: 16384       # v22: 4096 → 16384 (4×)
+  max_tokens: 18432           # v22: 8192 → 18432 (2K prompt + 16K gen)
+  greedy: false
+  temperature: 0.99           # 0.9 → 0.99
+  top_p: 0.99                 # 1.0 → 0.99
+  top_k: 100                  # -1 → 100
+
+eval_gconfig:
+  n_samples: 1                # eval 单样本, 降低 vLLM 负载
+  min_new_tokens: 0
+  max_new_tokens: 16384       # v22: 4096 → 16384 (与 train 一致)
+  max_tokens: 18432           # v22: 8192 → 18432
+  greedy: false
+  temperature: 0.6            # eval 用更确定的采样
+  top_p: 1.0
+  top_k: -1
+
+# ── Actor (Training) — 与 v17 同布局; PPO 超参对齐 8B ──
+actor:
+  backend: "megatron:(attn:d4p4t2|ffn:e8t1)"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32   # 35B 保留 fp32 reduce (8B 用 bf16; 这里精度优先)
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 18432   # v22: 8192 → 18432, 1 个 (2K prompt + 16K gen) 序列 (BSHD 强制单 seq/microbatch)
+    n_mbs_divisor: 1
+  pad_to_maximum: true         # Qwen3.5 GDN 强制 BSHD
+  optimizer:
+    type: adam                 # 8B 用 adam_bf16; 这里仍 fp32 (用户原则)
+    lr: 1.0e-6                 # 与 8B 一致
+    weight_decay: 0.1          # 0.01 → 0.1, 对齐 8B
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true   # 与 grad_reduce_dtype 配套
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  # ── PPO 超参 (与 8B benchmark 完全一致) ──
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  # 256 samples / 32 = 8/minibatch ÷ DP=4 = 2 sample/rank
+  # 与 v18 的 (32 samples / 4 minibatch / DP=4 = 2 sample/rank) 完全相同,
+  # 显存峰值预期一致, 只是 PPO 内做更多次梯度更新 (32 vs 4)。
+  ppo_n_minibatches: 32
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  # ── 35B 必需的 disk-mode (xccl 与 q||gate 不兼容) ──
+  weight_update_mode: disk
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — colocate 模式, 与 actor 共 GPU ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 18432   # v22: 8192 → 18432, 与 actor 一致
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── vLLM ──
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  dtype: ${actor.dtype}
+  # v22: 128 → 32, KV cache per seq 4× (18K vs 8K), 总 KV cache 持平 v21
+  max_num_seqs: 32
+  max_model_len: 18432          # v22: 8192 → 18432 (2K prompt + 16K gen)
+  gpu_memory_utilization: 0.68  # v17 实证安全值, 留 ~12 GB 给 weight-update 瞬态
+  enforce_eager: true           # Qwen3.5 cudagraph 兼容性问题, 与 v17 一致
+
+# ── Datasets ──
+# 数据集对齐 8B benchmark 用 deepmath_math_rule_20k (text-only 数学难题)。
+# valid 用 aime_2024_rule (与 8B benchmark 一致)。
+# 如果 deepmath 路径不可用, 回退用 dapo_math_17k_processed (v17 配置)。
+train_dataset:
+  batch_size: 32              # 4 → 32, 完全对齐 8B benchmark
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048            # v22: 4096 → 2048 (跟 max_tokens-max_new_tokens=2K 对齐, 8B benchmark 也是 1024)
+  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  type: deepmath
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048            # v22: 4096 → 2048 (跟 max_tokens-max_new_tokens=2K 对齐, 8B benchmark 也是 1024)
+  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
+  type: aime_2024
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: []
+  session_tracer:
+    enabled: true               # 对齐 8B benchmark, 开 session_tracer 收 timing 用于吞吐分析
+    flush_threshold: 256
