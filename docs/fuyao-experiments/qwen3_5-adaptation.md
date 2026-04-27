@@ -1,19 +1,27 @@
 # AReaL 适配 Qwen3.5 VL RLVR — 适配报告
 
-**日期**: 2026-04-23 → 2026-04-26
+**日期**: 2026-04-23 → 2026-04-27
 **作者**: zengbw
-**状态**: Qwen3.5-0.8B ✅ 已验证 · **Qwen3.5-35B-A3B ✅ 已验证**(6 节点上 20+ 次稳定 update_weights)
+**状态**:
+- Qwen3.5-0.8B ✅ 已验证
+- **Qwen3.5-35B-A3B ✅ 已验证**(v17 6 节点上 60+ 次稳定 update_weights, 21+ 小时长跑无显存泄漏)
+- **超参对齐 8B benchmark ✅** (v18: n_samples 2→8 显存不变; v20: batch 4→32 显存不变)
+- **序列长度推进 ✅** (v21: seq 4K, actor 41 GB; v22: seq 16K @ PP=4 验证中)
+- **xccl 优化路径根因定位 ✅** (GDN conv1d shape mismatch, 修复方案 D 待实施)
 
 本报告分两个阶段记录 AReaL 框架对 Qwen3.5 系列 VL 模型的端到端适配工作:
 
 - **第一阶段**(§§1–4): Qwen3.5-0.8B 稠密模型上线——建立基础配方
   (pad_to_maximum、disk 模式、output-gate 处理、fusion 禁用)。
-- **第二阶段**(§§5–8): Qwen3.5-35B-A3B (MoE) 模型上线——把基础配方扩展到
+- **第二阶段**(§§5.1–5.5): Qwen3.5-35B-A3B (MoE) 模型上线——把基础配方扩展到
   MoE + VL 包装结构, 修复一系列在小规模稠密模型上不会出现的问题
   (ref colocate OOM、expert export 转换、keepalive ghost ALLREDUCE、
   mbridge buffer 重置)。
+- **第三阶段**(§§5.6–5.8): 上线后的优化迭代——超参对齐 8B benchmark
+  (v18-v20)、序列长度推进至 16K (v21-v22)、update_weights 性能瓶颈分析、
+  CP 可行性调研 (硬阻断)、xccl 优化的根因定位 (GDN conv1d shape mismatch)。
 
-两个阶段共用同一个 docker 镜像、同一套环境变量前置, 启动脚本基本一致;
+两个/三个阶段共用同一个 docker 镜像、同一套环境变量前置, 启动脚本基本一致;
 差异仅在源码级修复和 YAML 集群布局。
 
 ## 1. 背景
@@ -452,6 +460,232 @@ train_dataset: { batch_size: 4 }
 对比之下, 之前每个版本 (v10–v16) 都在 §5.3 描述的四类 bug 之一上挂掉,
 最多撑过 1–2 次 `update_weights`。
 
+### 5.6 上线后的超参对齐 + 序列长度推进 (v18–v22)
+
+v17 跑通后, 围绕"对齐 8B benchmark 的超参风格"+"把序列长度推到 32K"两条
+线推进。设计原则: **每次只动一个变量, 用上一版的实测显存数据指导下一版决策,
+避免一步多改导致归因困难**。
+
+#### 5.6.1 实验配置矩阵
+
+所有版本均使用 `bifrost-2026042618245400-zengbw1` 验证过的 v17 基础设施
+(6 节点 32+16 GPU, PP=4, EP=8, weight_update_mode=disk, enable_offload=true,
+optimizer=adam fp32, pad_to_maximum=true)。变化仅在数据/序列维度:
+
+| 版本 | yaml | batch | n_samples | seq (gen) | ppo_n_mb | max_concurrent | vllm.max_num_seqs | 对齐目标 |
+|---|---|---|---|---|---|---|---|---|
+| **v17** (baseline) | `_6node.yaml` | 4 | 2 | 2K | 2 | 8 | 8 | 显存验证 |
+| **v18** (aligned) | `_6node_aligned.yaml` | 4 | **8** | 2K | **4** | **32** | **32** | n_samples → 8B 风格 |
+| **v19** (16k+batch32) | `_6node_aligned_16k.yaml` | **32** | 8 | **16K** | **8** | **256** | **256** | 一步到位 (失败: OOM 风险高 + ray 集群多次超时) |
+| **v20** (batch32) | `_6node_batch32.yaml` | **32** | 8 | 2K | **32** | **256** | **256** | batch 完全对齐 8B |
+| **v21** (seq8k) | `_6node_seq8k.yaml` | 32 | 8 | **8K** (max_new_tokens=4K) | 32 | **128** | **128** | 序列 sanity check |
+| **v22** (seq16k) | `_6node_seq16k.yaml` | 32 | 8 | **16K** | 32 | **32** | **32** | 中间步骤 (PP=4 不变) |
+
+每 PPO 内每 rank 每 minibatch 的样本数始终保持在 v18 的等价水平
+(`total_samples / ppo_n_minibatches / DP = 2 sample/rank`), 只通过同步放大
+ppo_n_minibatches 来抵消 batch_size 放大, 这是显存稳定的关键技巧。
+
+#### 5.6.2 实测显存数据 (PP=4 / 6 节点不变)
+
+| 版本 | seq | total samples/step | actor 显存 (实测) | vLLM 显存 (实测) | 备注 |
+|---|---|---|---|---|---|
+| v17 | 2K | 8 | **38.58 GB / 80 GB** (48.7%) | ~40 GB | 60 step soak 零增长 |
+| v18-r2 | 2K | 32 | **38.56 GB** | ~40 GB | n_samples 4× 不增显存 ✓ |
+| v20 | 2K | **256** | **40 GB** | **56 GB** | batch 8× → vLLM KV cache 涨 (max_num_seqs=256) |
+| **v21** | **8K** | 256 | **41 GB** | **55.5 GB** | seq 4× 几乎不涨 (与 v20 等价) ⭐ |
+| v22 | 16K | 256 | (验证中) | (验证中) | 预估 actor 45-55 GB |
+
+**关键洞察 (v21 数据颠覆原假设)**:
+
+之前 megatron-engine-expert 调研时预测 "MoE alltoall dispatch buffer 随 token 数线性增长,
+是 32K 路径的真正杀手"。v21 (8K, 4× v20 token) 实测显示 actor 显存仅
++1 GB, **MoE buffer 实际是 sublinear 的** (可能 EP=8 alltoall 实现有
+fixed-size cudagraph buffer, 或 token routing 的 kernel 复用)。
+
+这个发现直接简化了 32K 路径规划:
+
+- **专家原方案**: v22 必须切到 PP=8 (DP=2, layers 40/8=5 整除), v23 32K
+  必须 9 节点 (actor 64 + vLLM 8)
+- **基于 v21 实测的新方案**: v22 直接 16K @ PP=4 不变; 若 v22 实测 actor
+  < 50 GB, 则 v23 32K @ PP=4 也可能行, 不需要切 PP=8 / 加节点
+
+#### 5.6.3 故障与基础设施问题
+
+| 任务 | 故障 | 类型 | 处理 |
+|---|---|---|---|
+| v18 r1 | Ray 集群 4/6 节点超时 (400s) | 基础设施 | retry r2 成功 |
+| v19 r1/r2/r3 | Ray 集群 4-5/6 节点超时 (400-900s) | 基础设施 | 多次 retry |
+| 所有 6 节点任务 | 30% 概率出现节点未加入 Ray | fuyao 集群调度 | 暂以 retry 应对 |
+
+`fuyao_areal_run.sh` 的 `MAX_WAIT=900s` 已经放宽过一次, 但仍有节点完全死掉
+的情况。可考虑后续加申请 +1 容错节点的逻辑 (但需要绕过
+`SLURM_JOB_NUM_NODES != CONFIG_CLUSTER_NODES` 强校验)。
+
+### 5.7 update_weights 性能瓶颈分析 + 优化路径
+
+#### 5.7.1 v17 实测 timeline
+
+```
+08:55:08  Starting actor.update_weights (step 58)
+08:55:19  HF save synchronized                 ← _save_model_to_hf 仅 ~11s
+08:58:50  actor.update_weights completed       ← 总 3:42
+08:59:13  next step rollout pause              ← 训练步骤 ~23s (async overlap)
+```
+
+**update_weights 占整个 step time ~85%** (3:42 / 4:05)。拆分:
+
+| 阶段 | 耗时 | 占比 |
+|---|---|---|
+| `_save_model_to_hf` (32 actor ranks 写 HF safetensor 到 NFS) | ~11 s | ~5% |
+| vLLM reload (8 instance × 35 GB safetensor 从 NFS load) | **~226 s** | **~93%** |
+| barrier + cleanup | ~5 s | ~2% |
+
+瓶颈: **NFS 出口带宽被 8 个 vLLM instance × ~35GB 全量 reload 打死**, 不是
+vLLM 内部串行加载。
+
+#### 5.7.2 优化方向调研结论
+
+调用 megatron-engine-expert + 后续 0.8B xccl debug 实测后, 完整 ROI 表:
+
+| 方向 | 收益 | 工作量 | 状态 |
+|---|---|---|---|
+| **方向 1**: xccl + batch load_weights | 3.5min → **5-15s** | **2-4 小时** (本次实测后修正) | 根因已定位, 待实施 |
+| 方向 2: vLLM 内并发优化 | ≈0 (NFS 瓶颈不在 vLLM) | – | 否决 |
+| 方向 3-A: 更快共享存储 | 3.5min → 30-60s | 30 min (问运维) | 待问 |
+| 方向 4: ZMQ+IPC | ≈方向 1 (实际部署不 colocate) | 1-2 周 | 否决 (跨节点 IPC 不可用) |
+| 方向 5: 增量 sync | N/A (PPO 全量更新) | – | 否决 |
+| 方向 6: update_weights 与下一 step prepare_batch 重叠 | 3.5min → 30-60s | 2-3 天 | 备选 |
+| 方向 8: skip vision_model in disk save | -10 to -15s | 30 min | 顺手 |
+
+#### 5.7.3 xccl 失败的精确根因 (本次会话核心发现)
+
+**早期误判** (历史文档 §5 / megatron-engine-expert 第一轮):
+> "xccl sender 直接写 vLLM 内部 buffer, 与 q||gate fused tensor 不兼容,
+> 修复需要理解 vLLM 内部 buffer layout"
+
+**实测驳斥** ([vllm_worker_extension.py:181](areal/engine/vllm_ext/vllm_worker_extension.py#L181)
+xccl 路径**也是**通过 `model.load_weights` 注入, 不是直写 buffer。)
+
+**精确定位** (0.8B xccl debug r2, `bifrost-2026042714355601-zengbw1`):
+
+加 debug log 后捕获到失败的具体 tensor:
+
+```
+[xccl debug] load_weights FAILED at #8
+  name='model.language_model.layers.0.linear_attn.conv1d.weight'
+  shape=(3072, 1, 8) dtype=torch.bfloat16
+RuntimeError: The expanded size of the tensor (4) must match the existing
+              size (8) at non-singleton dimension 2.
+              Target sizes: [2048, 1, 4]. Tensor sizes: [2048, 1, 8]
+
+last_ok = 'model.language_model.layers.0.linear_attn.in_proj_a.weight'
+```
+
+**真正失败的不是 q_proj** (softmax attention 的 q||gate fused), **而是 GDN 层的
+`conv1d.weight`**:
+
+- mbridge 输出: `(3072, 1, 8)` — fused QKV (3072 = q_size + k_size + v_size),
+  kernel-padded from 4 to 8 (Megatron causal-conv1d 内核对齐要求)
+- vLLM 期望: `(2048, 1, 4)` — q-shard 单 stream, kernel=4
+
+**根因 (megatron-engine-expert 第二轮调研, agent a532c61950e9f9c1d)**:
+
+mbridge 的 `bridge.export_weights()` 和 `bridge._weight_to_hf_format()` per-tensor
+**输出完全一致** (`bridge.py:497` 内部就是调 `_weight_to_hf_format`)。所以
+"换 mbridge API" 解决不了问题。
+
+真正差异在 **vLLM 端的调用方式**:
+
+| 路径 | vLLM API | 调用粒度 | GDN conv1d 处理 |
+|---|---|---|---|
+| **AReaL disk** | `model_loader.load_weights(model, model_config=...)` | 通过 model_config 看完整 state_dict | model_loader 内部带 `packed_modules_mapping` 处理 fused tensor ✓ |
+| **AReaL xccl** | `model.load_weights(weights=[(name, t)])` | **单个 tensor** | 没机会触发 packed loader 拆解, shape 直接 mismatch ❌ |
+| **veRL** | `model.load_weights(weights=batch_iter)` | **批量** generator | vLLM 看到所有分量后按 packed_modules_mapping 派发 ✓ |
+
+`vllm_worker_extension.py:184-227` 的 for-loop 每次只喂一个 tensor 给
+`model.load_weights`, **绕开了 vLLM `packed_modules_mapping` 的 fused 派发机制**。
+GDN conv1d 这种需要 vLLM 端 packed loader 拆给三个 sub-module 的张量, 在
+单 tensor 调用下没法触发 fused loader 钩子。
+
+**veRL 的 ZMQ+IPC 路径之所以能跑**, 不是因为 mbridge 输出格式特殊 (输出和
+我们一致), 而是因为 vLLM 端调用粒度是 batch 的。
+
+#### 5.7.4 推荐修复方案 (方向 1, 最像 veRL)
+
+`vllm_worker_extension.py:184-227` 的 single-tensor for-loop:
+
+```python
+# 当前 (失败)
+for name, dtype, shape in zip(names, dtypes, shapes):
+    tensor = torch.empty(...)
+    torch.distributed.broadcast(tensor, ...)
+    self.model_runner.model.load_weights(weights=[(name, tensor)])  # ← 单个
+
+# 修复 (D 方案, 对齐 veRL)
+weights_buffer = []
+for name, dtype, shape in zip(names, dtypes, shapes):
+    tensor = torch.empty(...)
+    torch.distributed.broadcast(tensor, ...)
+    weights_buffer.append((name, tensor))
+self.model_runner.model.load_weights(weights=weights_buffer)  # ← 一次性
+```
+
+**预期收益**: update_weights 3.5 min → 5-15s (NCCL broadcast 35 GB on IB 几秒;
+免去 vLLM disk reload), step time 6 min → ~3 min, **~50% wall-clock 加速**。
+
+**显存代价**: vLLM worker 端瞬态多持一份完整 weights (35B/TP=2 ≈ 35 GB)。
+缓解: 按 `packed_modules_mapping` group 分批 broadcast (例如每个 layer 一批),
+峰值 << 35 GB。
+
+**工作量重估** (随调研推进收敛):
+- 最初专家估计: 1-2 天 (基于 q_proj 误判)
+- r2 实测后: 3-5 天 (基于"GDN tensor 全要 sender reshape"的中间假设)
+- **本次根因清晰后: 2-4 小时** (只改 vllm_worker_extension.py 一个 for 循环)
+
+### 5.8 CP (Context Parallel) 可行性调研
+
+为了支持 32K 序列, 调研过 CP=2 (沿 sequence 维度切半 activation) 是否可行。
+
+**结论: 硬阻断 (HARD BLOCK)**, 详见 megatron-engine-expert (agent
+a6081ad957786433c) 的完整分析。
+
+#### 5.8.1 决定性证据
+
+[`areal/engine/megatron_engine.py:1643-1647`](areal/engine/megatron_engine.py#L1643-L1647)
+的入口断言:
+
+```python
+if self.config.pad_to_maximum and cp_size > 1:
+    raise ValueError(
+        "pad_to_maximum=True is incompatible with context_parallel_size>1; "
+        "CP split logic in packed_context_parallel_forward requires cu_seqlens."
+    )
+```
+
+#### 5.8.2 完整因果链
+
+1. AReaL 的 CP 实现 (`packed_context_parallel.py`) **完全依赖 packed (THD)
+   格式**——用 `cu_seqlens` 切 sequence chunks 给每个 CP rank。
+2. Qwen3.5 GDN 强制 `pad_to_maximum=true` (§3 表 #1: mbridge 的 GDN 需要
+   `attention_mask`, AReaL 的 `pack_tensor_dict` 会移除它)。
+3. GDN 是 stateful recurrent linear attention (`S_t = S_{t-1} + k_t v_t^T`),
+   跨 rank 切 sequence 必须显式传递 recurrent state。docker 里的 mbridge
+   0.15.1 GDN 模块**没有 CP-aware recurrent state ring-pass 实现**。
+4. 32K 显存预估 (基于 v21 实测斜率): actor ~62-68 GB, 不切 PP 也接近
+   80 GB 上限。**CP 是不加节点上 32K 的唯一方案**, 但被以上三点封死。
+
+#### 5.8.3 替代方案 ROI 排序
+
+| 方案 | 收益 | 工作量 | 备注 |
+|---|---|---|---|
+| **PP=4 → PP=8** (同 6 节点) | params/optim 减半 + activation/rank 减半 | 1h (改 backend 字符串) | 40 layers / 8 = 5 ✓ 整除 |
+| 加节点到 8/9 (PP=8 + DP=4) | 同上 + DP 翻倍 | 中 (重新调度) | 9 节点 = 64 actor + 8 vLLM 是干净布局 |
+| actor params/optim CPU offload | -16 GB | 1-2 周 | 长期工作, 不是 32K 应急 |
+| ETP > 1 | MoE FFN 跨 TP 分摊 | 中 | `moe_intermediate_size=512`, ETP=2 后 256, 效率差 |
+
+实际上 v21 实测显示 **MoE buffer sublinear**, 让上面"32K 必须切 PP"的预估
+变得过于悲观——v22/v23 跑出实测后再确定是否真的需要切 PP=8 或加节点。
+
 ## 6. 代码改动汇总
 
 所有提交在 `zbw-ai/AReaL-xpeng-from-zjh` 的 `main` 分支。
@@ -491,6 +725,23 @@ train_dataset: { batch_size: 4 }
 所有改动**与 Qwen3.5 无强绑定**——它们是受益于任何后续 MoE/VL 模型上线的
 通用 fix (尤其是 §5.3.1 和 §5.3.3)。
 
+### 6.3 第三阶段 (上线后优化迭代)
+
+| 分组 | 文件 | 改动 | Commit |
+|---|---|---|---|
+| **§5.6 超参对齐 8B** | `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_aligned.yaml` | v18: n_samples 2→8, ppo_n_minibatches 2→4, weight_decay 0.01→0.1 | `62c8c97` |
+| | `fuyao_examples/math/deploy_qwen3_5_35b_aligned.sh` | v18 一键启动脚本 | `62c8c97` |
+| | `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_batch32.yaml` | v20: batch 4→32, ppo_n_minibatches 4→32, max_concurrent/max_num_seqs 32→256 | `3929744` |
+| **§5.6 序列推进** | `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_aligned_16k.yaml` | v19: batch=32 + seq=16K (一步到位, OOM 风险) | `573b9ab` |
+| | `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq8k.yaml` | v21: 8K seq sanity check, max_num_seqs 256→128 | `63c4f6e` |
+| | `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq16k.yaml` | v22: 16K seq @ PP=4 不变 (基于 v21 实测乐观推进) | `ee829d3` |
+| **§5.7 xccl 调研** | `areal/engine/vllm_ext/vllm_worker_extension.py` | xccl 路径加 `[xccl debug]` 逐 tensor trace + `_summarize_checkpoint_keys` (disk 路径) | `44b4615` |
+| | `fuyao_examples/math/qwen3_5_0_8b_rlvr_vllm_xccl_debug.yaml` | 0.8B xccl 复现配置 | `44b4615` |
+| | `areal/engine/vllm_ext/vllm_worker_extension.py` | 修复 `logger.info(..., flush=True)` TypeError (logging.Logger 不接受 flush kwarg) | `0995f59` |
+
+第三阶段总计: ~6 commit, 全部聚焦在 yaml 配置 + 1 处 vllm extension debug。
+**xccl 实际修复 (方向 1, 方案 D 批量 load_weights) 待实施**, 详见 §9.1。
+
 ## 7. 复现命令
 
 ```bash
@@ -506,7 +757,7 @@ fuyao deploy --disable-fault-tolerance \
         --run-type math_rlvr \
         --config fuyao_examples/math/qwen3_5_0_8b_rlvr_vllm.yaml
 
-# 35B-A3B 生产 (第二阶段, 推荐)
+# 35B-A3B v17 baseline (验证稳定, batch=4 n_samples=2 seq=2K)
 fuyao deploy --disable-fault-tolerance \
     --docker-image=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:areal-qwen3_5-megatron-v21 \
     --project=rc-ai-infra --experiment=zengbw1/llm_rl \
@@ -517,6 +768,30 @@ fuyao deploy --disable-fault-tolerance \
     bash fuyao_examples/fuyao_areal_run.sh \
         --run-type math_rlvr \
         --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node.yaml
+
+# 35B-A3B v20 batch=32 (对齐 8B benchmark batch 维度, seq 仍 2K, 推荐)
+fuyao deploy --disable-fault-tolerance \
+    --docker-image=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:areal-qwen3_5-megatron-v21 \
+    --project=rc-ai-infra --experiment=zengbw1/llm_rl \
+    --gpu-type a100 --gpus-per-node 8 --node=6 \
+    --label=qwen3_5-35b-a3b-batch32 \
+    --site=fuyao_b1 --queue=rc-llmrl-a100 \
+    SWANLAB_API_KEY=<key> \
+    bash fuyao_examples/fuyao_areal_run.sh \
+        --run-type math_rlvr \
+        --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_batch32.yaml
+
+# 35B-A3B v22 长上下文 (16K seq + batch=32, PP=4 不变)
+fuyao deploy --disable-fault-tolerance \
+    --docker-image=infra-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/data-infra/fuyao:areal-qwen3_5-megatron-v21 \
+    --project=rc-ai-infra --experiment=zengbw1/llm_rl \
+    --gpu-type a100 --gpus-per-node 8 --node=6 \
+    --label=qwen3_5-35b-a3b-seq16k \
+    --site=fuyao_b1 --queue=rc-llmrl-a100 \
+    SWANLAB_API_KEY=<key> \
+    bash fuyao_examples/fuyao_areal_run.sh \
+        --run-type math_rlvr \
+        --config fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq16k.yaml
 ```
 
 ## 8. 经验教训
@@ -548,22 +823,82 @@ fuyao deploy --disable-fault-tolerance \
    还把 per-rank expert 数量砍半 (1280 → 640 specs), 进而成比例缩小 save 时
    NCCL 流量。
 
+7. **超参对齐时, 同步放大 ppo_n_minibatches 是显存稳定的关键**。v18-v20
+   把 batch_size × n_samples 从 8 升到 256 (32×) 时, ppo_n_minibatches
+   也从 2 升到 32, 维持 `total_samples / ppo_n_minibatches / DP` 不变,
+   每 rank 每 minibatch 仍是 2 sample, **显存峰值实测和 v17 一致**
+   (38.56 GB). 这个技巧让 batch 维度的对齐不带显存代价。
+
+8. **MoE alltoall buffer 实测是 sublinear 的, 不要被理论预估吓住**。
+   megatron-engine-expert 第一轮预测 "32K 必然爆炸", v21 (8K, 4× v20
+   token) 实测 actor 显存仅 +1 GB。EP=8 alltoall 实现可能有 fixed-size
+   cudagraph buffer 或 token routing kernel 复用, 实际系数远低于理论
+   linear。**新模型/大序列实测优先于纯理论估算**。
+
+9. **debug log 自身的 bug 会掩盖真实信号**。0.8B xccl debug r1 在
+   `logger.info(..., flush=True)` 触发 `TypeError: Logger._log() got an
+   unexpected keyword argument 'flush'`, 这个 TypeError 被外层
+   try/except 吞了, 让我们一开始误以为是真实 load_weights 失败。修
+   debug log 时**避免和被诊断代码混入异常路径**, 或至少用 `logging`
+   而非 `print` 风格签名。
+
+10. **xccl 失败的真正根因不一定是 sender 端的 tensor 形状**。AReaL 文档
+    最初记述 "xccl 直接写 vLLM 内部 buffer" 是不准确的。xccl 也走
+    `model.load_weights`, 真正问题是**调用粒度**: 单 tensor 调用绕开了
+    vLLM 的 packed_modules_mapping fused 派发, 让需要 vLLM 端拆解的
+    fused tensor (q_proj+attn_gate, gate_up_proj, GDN conv1d) 直接撞进
+    sub-module 的单 tensor weight_loader。修复方案是 **batch
+    load_weights** (对齐 veRL), 不是 sender 端 reshape。
+
 ## 9. 后续工作
 
-1. **xccl Qwen3.5 对齐** (1-2 天): 改 AReaL xccl sender 在广播进 vLLM 内部
-   buffer 之前先拆 q||gate。消除每次 `update_weights` ~3.5 分钟的 disk 模式
-   往返。
-2. **MoE expert 导出贡献回上游**: 把 `_qwen3_5_moe_fallback_expert_export`
-   语义贡献回 mbridge, 让后续 mbridge 版本原生处理 VL 前缀。
-3. **ZMQ+IPC 路径** (1-2 周): 把 veRL 的 ZMQ/IPC 权重传输移植到 AReaL,
-   完全对齐 veRL 跑通的路径; 消除 disk IO。
-4. **Eval 限流**: `evaluator.freq_steps=20` 触发整个 `valid_dataset` 一次,
-   eval 边界处占用大量 wall-clock。增加 `evaluator.max_samples` 或用
-   256 样本切片做训练中 eval。
-5. **长跑稳定性**: 已验证 20 次 update; 建议跑 24 小时 soak (≥200 次)
-   才能向第三方用户宣称生产可用。
-6. **CP=2 + GDN 兼容性**: 能再砍 ~50% activation, 让 4 节点 PP=2 也有
-   充足 headroom。
-7. **Tree attention + Qwen3.5**: 未测试; 如启用很可能需要额外修复。
-8. **FP8 训练**: `attn_output_gate` + FP8 当前不兼容 (代码里 assert 死);
-   需要 mbridge 上游支持。
+1. **🔥 xccl 优化 (方案 D 批量 load_weights)** (2-4 小时, 高 ROI):
+   `vllm_worker_extension.py:184-227` 的 single-tensor for-loop 改成
+   "先收齐所有 (name, tensor) 再一次性 `model.load_weights(weights=
+   batch)`", 让 vLLM 的 packed_modules_mapping 处理 GDN conv1d /
+   q||gate 等 fused tensor 的拆解。**预期 update_weights 3.5 min →
+   5-15s, step time 6 min → ~3 min, 50% wall-clock 加速**。
+   先在 0.8B (`qwen3_5_0_8b_rlvr_vllm_xccl_debug.yaml`) 验证, 通过后
+   迁到 35B-A3B。详见 §5.7.
+
+2. **update_weights 与下一 step prepare_batch 重叠** (方向 6, 备选,
+   2-3 天): 若 xccl 修复有困难, 可改 `_update_weights_from_disk` 拆成
+   `_save_and_dispatch` (同步 11s) + `_await_pending_reload` (异步),
+   trainer 主循环在 save 完成后立即开始下一 step, 让 vLLM reload 的
+   226s 与 prepare_batch 重叠。**不依赖 xccl, 收益 ~50%**。
+
+3. **MoE expert 导出贡献回上游 mbridge**: 把
+   `_qwen3_5_moe_fallback_expert_export` 语义贡献回 mbridge, 让后续
+   mbridge 版本原生处理 VL 前缀。
+
+4. **ZMQ+IPC 路径** (1-2 周): 把 veRL 的 ZMQ/IPC 权重传输移植到 AReaL.
+   注意: actor/vLLM 在当前部署下**不在同一节点 colocate**, CUDA IPC
+   不跨节点, 实际收益等价方案 1 (xccl batch), 工作量 5-10×。
+   **当前不推荐**, 除非未来改 colocate 部署。
+
+5. **32K 序列推进 (v23)**: 待 v22 (16K @ PP=4) 实测后决定。
+   - v22 actor < 50 GB → v23 32K @ PP=4 也可能行, 不需要切 PP=8
+   - v22 actor 50-60 GB → v23 必须切 PP=8 (40 layers / 8 = 5 整除)
+   - v22 actor > 60 GB → 需要加节点到 8/9 (actor 64 + vLLM 8 干净布局)
+
+6. **Eval 限流**: `evaluator.freq_steps=20` 触发整个 `valid_dataset`
+   一次, eval 边界处占用大量 wall-clock (v17 实测 evaluator 占 15+
+   小时中的 ~10 小时)。增加 `evaluator.max_samples` 或用 256 样本
+   切片做训练中 eval。
+
+7. **长跑稳定性**: v17 已验证 60+ step / 21+ 小时, 接近 production-ready。
+   建议跑 24 小时 soak (≥200 step) 才能向第三方用户宣称稳定。
+
+8. **CP=2 + GDN 兼容性** (硬阻断, 见 §5.8): 当前不可行, 需要 mbridge
+   GDN 模块加 CP-aware recurrent state ring-pass + AReaL 加 BSHD CP
+   path。工作量等同新 feature, 不在 short-term 计划。
+
+9. **Ray 集群启动健壮性**: fuyao 6 节点任务约 30% 概率出现节点未加入,
+   `MAX_WAIT=900s` 下仍超时。可改 `fuyao_areal_run.sh` 容错: 申请
+   N+1 节点, 等到 N 个 join 即开始, 留 1 节点冗余。但需要绕过
+   `SLURM_JOB_NUM_NODES != CONFIG_CLUSTER_NODES` 强校验。
+
+10. **Tree attention + Qwen3.5**: 未测试; 如启用很可能需要额外修复。
+
+11. **FP8 训练**: `attn_output_gate` + FP8 当前不兼容 (代码里 assert
+    死); 需要 mbridge 上游支持。
