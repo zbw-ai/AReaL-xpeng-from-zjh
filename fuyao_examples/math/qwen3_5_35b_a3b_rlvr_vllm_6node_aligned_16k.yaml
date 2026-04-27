@@ -1,0 +1,264 @@
+# Qwen3.5-35B-A3B Math RLVR — 16K seq + 8B-style batch (v19)
+#
+# 基于 v18 (qwen3_5_35b_a3b_rlvr_vllm_6node_aligned.yaml) 进一步迭代:
+#   - max_new_tokens: 2048 → 16384 (16K)
+#   - batch_size: 4 → 32 (对齐 8B benchmark)
+#   - 总 token/step: 64K → 4M (~64× v18, ~50% 8B benchmark 的 8M)
+#
+# v18 实测基线 (bifrost-2026042709444101-zengbw1, step 17):
+#   ppo_update peak: 21.27 GB allocated / 24.94 GB reserved / 38.56 GB device
+#   显存几乎与 v17 完全一致 → ~40 GB headroom 可以放给 seq 长度
+#
+# v19 显存预估 (基于 1 microbatch = 1 seq × 18K tokens, pad_to_maximum + BSHD 必装单 seq):
+#   - Params + optim states (PP=4, DP=4 shard): ~14  GB
+#   - Activation (16K seq, full recompute):     ~30-40 GB
+#   - Grad reduce buffer (fp32):                ~5   GB
+#   - PyTorch caching + ref onload 瞬态:        ~10  GB
+#   - Total reserved 估计:                       ~55-65 GB / 80 GB (~78%)
+#   - Headroom:                                  ~10-15 GB ⚠️ 偏紧, 可能 OOM
+#
+# OOM 回退方案 (按风险递减):
+#   1. batch_size: 32 → 16 (samples 128, 减半 wall-clock)
+#   2. max_new_tokens: 16384 → 12288 (12K, activation 减 25%)
+#   3. ppo_n_minibatches: 8 → 16 (单次 update 显存稍减; 但 PPO update 次数翻倍, 算法噪声)
+#   4. context_parallel CP=2 (untested, 改 backend 风险大)
+#
+# Wall-clock 预估:
+#   v18 (2K seq, 32 samples):  step ~4 min (rollout async overlap + ~3.5 min disk update)
+#   v19 (16K seq, 256 samples):
+#     - vLLM rollout: 256 × 16K = 4M tok / 16 GPU
+#       35B vLLM ~50-80 tok/gpu/s → ~50 min (但 async, 不 100% 卡 step 时间)
+#     - actor train_step: 单 forward 18K seq, full recompute → ~30 s
+#       8 microbatch/rank × 8 ranks → 几分钟 train_step
+#     - update_weights: 仍 ~3.5 min (NFS bound, seq 长度无关)
+#     - 估计总 wall-clock: 8-15 min/step (受 vLLM gen 速度主导)
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-aligned-16k
+trial_name: trial0
+
+seed: 42
+enable_offload: true
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 6
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+# ── Rollout (Inference) ──
+rollout:
+  backend: "vllm:d8t2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 1200.0
+  # batch_size × n_samples = 32 × 8 = 256 (完全对齐 8B benchmark)
+  max_concurrent_rollouts: 256
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config ──
+gconfig:
+  n_samples: 8                # 对齐 8B
+  min_new_tokens: 0
+  max_new_tokens: 16384       # 2048 → 16384 (8× v18)
+  max_tokens: 18432           # = 16384 gen + 2048 prompt headroom
+  greedy: false
+  temperature: 0.99
+  top_p: 0.99
+  top_k: 100
+
+eval_gconfig:
+  n_samples: 1
+  min_new_tokens: 0
+  max_new_tokens: 16384       # eval 也用 16K (deepmath 类难题需要长推理)
+  max_tokens: 18432
+  greedy: false
+  temperature: 0.6
+  top_p: 1.0
+  top_k: -1
+
+# ── Actor (Training) ──
+actor:
+  backend: "megatron:(attn:d4p4t2|ffn:e8t1)"   # 32 GPU, 与 v17/v18 相同
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    # 单 microbatch 装 1 个 (2K prompt + 16K gen = 18K) 序列。pad_to_maximum=true
+    # 模式下 BSHD 强制单 seq/microbatch, max_tokens_per_mb 必须 ≥ max_tokens。
+    max_tokens_per_mb: 18432
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer:
+    type: adam              # fp32 states (用户原则)
+    lr: 1.0e-6
+    weight_decay: 0.1       # 对齐 8B
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  # 256 samples / 8 minibatch = 32 sample/minibatch ÷ DP=4 = 8 sample/rank
+  # 每 rank 8 microbatch (8 sample × 18K tokens).
+  # ppo_n_minibatches=8 接近 8B benchmark 的等效切分密度 (8B: 256/2=128 sample/mb,
+  # 我们这里因为 35B 显存约束切得更细一点)。
+  ppo_n_minibatches: 8
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  weight_update_mode: disk
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — colocate ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 18432
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── vLLM ──
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  dtype: ${actor.dtype}
+  # 与 batch_size×n_samples=256 相匹配, 让 vLLM 调度满载
+  max_num_seqs: 256
+  max_model_len: 18432         # 18K seq (2K prompt + 16K gen), 必须 ≥ gconfig.max_tokens
+  gpu_memory_utilization: 0.72  # 16K seq 下 KV cache 需要更多空间, 比 v17 略放宽
+  enforce_eager: true
+
+# ── Datasets — 与 v18 一致 ──
+train_dataset:
+  batch_size: 32              # 完全对齐 8B benchmark (4 → 32, 8×)
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048             # prompt 上限 (与 max_tokens - max_new_tokens 一致)
+  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  type: deepmath
+
+valid_dataset:
+  batch_size: 16              # 对齐 8B benchmark
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048
+  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
+  type: aime_2024
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  # 16K seq + 256 samples 下, eval 单次会非常慢。改 100 step 一次, 减少 wall-clock 占比。
+  freq_steps: 100
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: []
+  session_tracer:
+    enabled: true                # 收 timing, 便于吞吐分析
+    flush_threshold: 256
