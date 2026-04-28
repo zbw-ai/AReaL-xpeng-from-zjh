@@ -1,0 +1,214 @@
+# Qwen3.5-0.8B Math RLVR — CP=2 实验配置
+#
+# 目的: 探测 BSHD + cp_size=2 在 Megatron 0.18 dev (commit 20ba03f) GDN CP 下的实际行为。
+#
+# 与基线 qwen3_5_0_8b_rlvr_vllm.yaml 仅差 backend:
+#   actor.backend: "megatron:d2p1t2" → "megatron:d1p1t2c2"
+#     DP=2 → DP=1 (CP=2 占用 2 GPU; actor 仍 4 GPU)
+#   ref.backend: ${actor.backend}  (跟着切)
+#
+# Actor (4 GPU): megatron:d1p1t2c2 (DP=1 × PP=1 × TP=2 × CP=2 = 4 GPU)
+# vLLM  (4 GPU): vllm:d4t1 (不变)
+#
+# 预期观察点（cp_size > 1 + pad_to_maximum=True 第一次实测）:
+#   1. Megatron init: GDN module 现在应该读 pg_collection.cp.size()=2 (commit 20ba03f)
+#   2. forward shape: 看 model.forward 接收 [B, S=4096] 还是要 caller 预切 [B, S/cp=2048]
+#   3. 错误信号导向 Task 5 实现路径 (caller-managed split/gather vs model-managed)
+#
+# 不开 ppo_n_minibatches > 1, 不开 max_new_tokens 增大 — 保持快速验证。
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-0_8b-cp2-experiment
+trial_name: trial0
+
+seed: 42
+enable_offload: false
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 1
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+rollout:
+  backend: "vllm:d4t1"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 600.0
+  max_concurrent_rollouts: 16
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+gconfig:
+  n_samples: 4
+  min_new_tokens: 0
+  max_new_tokens: 2048
+  greedy: false
+  temperature: 0.9
+  top_p: 1.0
+  top_k: -1
+
+actor:
+  backend: "megatron:d1p1t2c2"  # ← CP=2 实验; DP=1 PP=1 TP=2 CP=2 = 4 GPU
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3.5-0.8B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.01
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  ppo_n_minibatches: 1
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  weight_update_mode: disk
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 4096
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  dtype: ${actor.dtype}
+  max_num_seqs: 16
+  max_model_len: 4096
+  gpu_memory_utilization: 0.8
+  enforce_eager: true
+
+train_dataset:
+  batch_size: 4
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  path: /workspace/zhangjh37@xiaopeng.com/data/dapo_math_17k_processed
+  type: dapo_math
+
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  session_tracer:
+    enabled: false
