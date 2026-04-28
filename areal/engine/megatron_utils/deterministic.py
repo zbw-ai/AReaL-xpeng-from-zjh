@@ -73,6 +73,32 @@ def disable_qwen3_5_incompatible_fusions(model_config):
             before_cp,
         )
 
+    # Disable Multi-Token Prediction (MTP) for RL training:
+    #   1. RL doesn't need MTP — it's a pretraining/inference acceleration feature.
+    #   2. Megatron 0.18 dev MTP module (multi_token_prediction.py:905) has a hidden-dim
+    #      mismatch bug under cp_size>1: _concat_embeddings does
+    #      `torch.cat((decoder_input, hidden_states), -1)` where decoder_input has
+    #      hidden=H/TP but hidden_states (after GDN CP) has hidden=H/TP/CP, raising
+    #      "Sizes of tensors must match except in dimension 2" RuntimeError.
+    #   3. mbridge's _build_mtp_config unconditionally enables MTP whenever
+    #      hf_config.text_config.mtp_num_hidden_layers > 0 (Qwen3.5 ships with this set).
+    if getattr(model_config, "mtp_num_layers", 0) and model_config.mtp_num_layers > 0:
+        before_mtp = model_config.mtp_num_layers
+        model_config.mtp_num_layers = 0
+        # Also clear loss scaling so any residual MTP probe does not contribute to loss.
+        if hasattr(model_config, "mtp_loss_scaling_factor"):
+            model_config.mtp_loss_scaling_factor = 0.0
+        print(
+            f"[disable_qwen3_5_incompatible_fusions] mtp_num_layers was={before_mtp}, "
+            f"now 0 (RL training does not use MTP; avoids cp>1 hidden-dim mismatch).",
+            flush=True,
+        )
+        logger.info(
+            "Disabled MTP (mtp_num_layers %d → 0): RL training does not need MTP, "
+            "and Megatron 0.18 dev MTP _concat_embeddings has hidden-dim bug under cp>1.",
+            before_mtp,
+        )
+
 
 def set_deterministic_algorithms(model_config):
     """
