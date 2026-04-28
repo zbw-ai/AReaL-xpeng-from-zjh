@@ -185,6 +185,57 @@ RUN pip show megatron-core mbridge \
 - 删 [megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) 的 `pad_to_maximum + cp_size > 1` ValueError
 - 替换为详细注释说明 Megatron 0.18 dev (commit 20ba03f) 已支持 BSHD CP
 
+### v24 cp=2 r1+r2 实测 + veRL 实证发现（2026-04-28 后期）
+
+#### v24 cp=2 r1: GDN unexpected cp_comm_type kwarg
+**错误**: `TypeError: GatedDeltaNet.__init__() got an unexpected keyword argument 'cp_comm_type'`
+**根因**: Megatron 0.18 dev `transformer_layer.py:314-320` 在 `cp_size > 1` 且 `cp_comm_type is not None` 时把 `cp_comm_type` forward 给 `self_attention.build_module`。但 GDN `__init__` (commit 20ba03f) 没有 `**kwargs`，硬拒。
+**临时修复** (commit 2660cbd): AReaL 端 `disable_qwen3_5_incompatible_fusions` 把 `tf_config.cp_comm_type = None` 让 transformer_layer 检查失败不再 forward。
+
+#### v24 cp=2 r2: MTP `_concat_embeddings` hidden-dim 不匹配
+**错误**: `RuntimeError: Sizes of tensors must match except in dimension 2. Expected size 1096 but got size 548`
+**根因**: Megatron 0.18 dev MTP 模块 `multi_token_prediction.py:905` 在 `cp_size > 1` 下 `_concat_embeddings`：`decoder_input` (H/TP=1096) vs `hidden_states` (经过 GDN CP 后 H/TP/CP=548) hidden 维不一致。mbridge 看到 Qwen3.5 hf config `text_config.mtp_num_hidden_layers > 0` 无条件启用 MTP。
+**临时修复** (commit cf2c680): AReaL 端 `disable_qwen3_5_incompatible_fusions` 强制 `tf_config.mtp_num_layers = 0`（RL 训练不需要 MTP）。
+
+#### 关键转折: veRL 实证黑盒 + 0f6fcb0 自动修复
+
+参考 `/Users/zengbw/Codebase/for_llm_train_070/llm_train_sft_0402/docs/qwen35_long_context_cp.md` + 实测任务 `bifrost-20260427195027004ntu-zengbw1` (4 节点 32 卡 SFT 32K + CP=2, 已跑通 120+ step)：
+
+veRL 实际配置（从日志中读出 `Qwen3_5VLTransformerConfig`）:
+```
+context_parallel_size=2, sequence_parallel=True
+expert_model_parallel_size=8, expert_tensor_parallel_size=1
+mtp_num_layers=1                  ← MTP 没禁用
+cp_comm_type='p2p'                ← 没清掉
+recompute_granularity='selective' ← 不是 'full'
+bias_activation_fusion=True       ← 没禁用
+bias_dropout_fusion=True          ← 没禁用
+apply_rope_fusion=False           ← 禁用 (与我们一致)
+masked_softmax_fusion=False       ← 禁用 (与我们一致)
+```
+
+veRL 用 megatron commit `0f6fcb0` (PR #4230 follow-up, dev branch, Apr 13)。直接对比：
+- **20ba03f** (我们 v24): `def __init__(self, config, ..., pg_collection=None,)` — 无 `**kwargs`
+- **0f6fcb0** (veRL): `def __init__(self, config, ..., pg_collection=None, **kwargs,)` — **有 `**kwargs`** 吞下 cp_comm_type
+
+**结论**: PR #4230 不止修 padding alignment, 还在 GDN init 加 `**kwargs` 让 transformer_layer 的 cp_comm_type forward 不再 crash。
+
+**升级到 0f6fcb0 (v25) 后, AReaL 端 cp_comm_type 清空 patch 变得多余但无害**, MTP 在 thd 路径下 veRL 验证可工作但我们走 bshd 路径仍未知.
+
+#### v25 dockerfile 改动 (commit 95d3676)
+
+按 veRL 方案对齐:
+1. megatron-core: `20ba03f` → `0f6fcb0` (PR #4230, GDN init `**kwargs` + padding fix)
+2. 加 `_coalescing_manager` bypass patch (NCCL 不支持 coalesced API, step 1 必崩)
+3. build-time 新增 assert: `_resolve_cu_seqlens` 函数存在 (PR #4230 主修复) + `PATCHED_FOR_NCCL_COALESCING_BUG` 标记
+
+AReaL 端 patches 维持 (作为防御性 fallback):
+- `cp_comm_type` 清空 (0f6fcb0 已自动吞, 无害)
+- MTP 禁用 (RL 不需要, bshd+cp+mtp 路径未验证)
+- fail-fast guard 删除
+
+待验证: v25 cp=2 实验是否过 compute_logp。如果过, 进入 Task 5 (BSHD CP 后处理)。
+
 ### Task 5 调研发现（pending，等 v24 镜像）
 
 调研 [megatron 0.18 GDN test](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../tests/unit_tests/ssm/test_gated_delta_net.py)、[GPTModel.forward](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../megatron/core/models/gpt/gpt_model.py)、[mamba_context_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../megatron/core/ssm/mamba_context_parallel.py) 后，**核心不确定点**：
