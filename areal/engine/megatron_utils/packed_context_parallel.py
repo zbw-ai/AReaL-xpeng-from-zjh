@@ -66,6 +66,65 @@ def preprocess_packed_seqs_context_parallel(
     return splitted.unsqueeze(0), packed_seq_params
 
 
+def _bshd_cp_zigzag_gather(output: torch.Tensor) -> torch.Tensor:
+    """All-gather BSHD output `[B, S/cp, ...]` across CP group and unzigzag back to `[B, S, ...]`.
+
+    GDN's CP scheme (mamba_context_parallel.py) and TE's CP both follow the same
+    zigzag chunk distribution for causal-attention load balance:
+
+        Total seq is split into ``2*cp_size`` chunks. Rank ``i`` holds two chunks:
+            - chunk index ``i``               (front half)
+            - chunk index ``2*cp_size-1-i``   (back half)
+        Each rank's local seq is the concatenation: ``[chunk_i, chunk_{2*cp_size-1-i}]``.
+
+    This function reverses that distribution by all-gathering and re-assembling.
+
+    Args:
+        output: Per-rank BSHD tensor of shape ``[B, S_local, ...]`` where
+            ``S_local = S_full / cp_size`` (must be divisible by 2).
+    Returns:
+        Full BSHD tensor of shape ``[B, S_full, ...]``.
+    """
+    cp_size = mpu.get_context_parallel_world_size()
+    cp_rank = mpu.get_context_parallel_rank()
+    cp_group = mpu.get_context_parallel_group()
+    if cp_size <= 1:
+        return output
+
+    output = output.contiguous()
+    # All-gather: gathered[i] is rank i's local output (NOT autograd-aware here;
+    # we only run this in inference paths — compute_logp / eval forward — where
+    # outputs need not be backward-differentiable through the all-gather. For
+    # train-step BSHD CP we must use a differentiable variant before turning on.)
+    gathered = [torch.empty_like(output) for _ in range(cp_size)]
+    dist.all_gather(gathered, output.detach(), group=cp_group)
+    # Make sure local rank's slot keeps the autograd-tracked tensor.
+    gathered[cp_rank] = output
+
+    # Each rank's local seq is two zigzag chunks: front_chunk + back_chunk.
+    # local_len = S_full / cp_size, half = local_len // 2 = S_full / (2*cp_size)
+    local_len = output.shape[1]
+    assert local_len % 2 == 0, (
+        f"BSHD CP local seq length must be even (zigzag), got {local_len}"
+    )
+    half = local_len // 2
+    full_len = local_len * cp_size
+    # 2*cp_size chunks each of size `half`
+    chunks: list[torch.Tensor | None] = [None] * (2 * cp_size)
+    for i in range(cp_size):
+        local = gathered[i]
+        front, back = local[:, :half, ...], local[:, half:, ...]
+        chunks[i] = front
+        chunks[2 * cp_size - 1 - i] = back
+
+    # Concat in chunk order along seq dim
+    full = torch.cat(chunks, dim=1)
+    assert full.shape[1] == full_len, (
+        f"BSHD CP unzigzag shape mismatch: got {full.shape[1]}, expected {full_len}"
+    )
+    return full
+
+
 def postprocess_packed_seqs_context_parallel(
     output: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
@@ -77,8 +136,14 @@ def postprocess_packed_seqs_context_parallel(
     cp_size = mpu.get_context_parallel_world_size()
     if not post_process:
         return output
-    if cp_size <= 1 or cu_seqlens is None:
+    if cp_size <= 1:
         return output.squeeze(0)
+    if cu_seqlens is None:
+        # BSHD path under cp_size>1: model returned `[B, S/cp, V]` after GDN's
+        # internal head-parallel CP. Re-assemble full `[B, S, V]` via all-gather +
+        # zigzag unshuffle so caller-side ops (logprobs gather, loss) can index
+        # into full input_ids.
+        return _bshd_cp_zigzag_gather(output)
     # shape = [batch_size, seq_len] + list(output.shape[2:])
     # [1, packed, dim] -> [batch_size, seq_len, dim]
     batch_size = cu_seqlens.shape[0] - 1
