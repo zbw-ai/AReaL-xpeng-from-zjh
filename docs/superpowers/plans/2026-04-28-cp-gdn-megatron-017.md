@@ -166,6 +166,56 @@ RUN pip show megatron-core mbridge \
 
 实际不需要切 NVIDIA Megatron-Bridge。mbridge main 完全胜任。
 
+### Task 1.5: 切到 megatron-core git+main commit (Apr 13 PR #2642)
+
+**触发原因**：v23 smoke test 通过后，Task 3 调研发现 `megatron-core==0.17.0` PyPI release tag **不含** GDN CP 代码（PR #2642 在 release branch cut 之后才合入 main）。`core_v0.17.0` tag 的 `gated_delta_net.py` 仍然是 `# TODO: Implement GatedDeltaNetContextParallel`。
+
+**改动** (commit `d068697`)：
+- dockerfile 把 `megatron-core==0.17.0` 替换为 `megatron-core @ git+...@20ba03fec03ebaec050c6bc7e79b77a4b4b5c000`
+- 该 commit 是 PR #2642 的 merge commit (Apr 13, 2026, CI 已验证)
+- 选这个 commit 而不是更新的 main HEAD：避免 Apr-19 MambaModel→HybridModel rename、Apr-22 DDP refactoring (#3812) 等后续可能引入的 break
+- 内部 version 是 0.18.0 (main 已进入下个迭代周期)
+- build 末尾加 `assert 'self.cp_size = self.pg_collection.cp.size()' in src` 强制验证 GDN CP 代码存在；缺则 build fail-fast
+
+**待执行**：构建 v24 镜像 + 跑 0.8B smoke test（不开 CP）确认升级后现有流程仍可跑。
+
+### Task 4: 删 BSHD-CP fail-fast guard ✅ 已完成
+
+**改动** (commit `2f786e6`)：
+- 删 [megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) 的 `pad_to_maximum + cp_size > 1` ValueError
+- 替换为详细注释说明 Megatron 0.18 dev (commit 20ba03f) 已支持 BSHD CP
+
+### Task 5 调研发现（pending，等 v24 镜像）
+
+调研 [megatron 0.18 GDN test](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../tests/unit_tests/ssm/test_gated_delta_net.py)、[GPTModel.forward](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../megatron/core/models/gpt/gpt_model.py)、[mamba_context_parallel.py](https://github.com/NVIDIA/Megatron-LM/blob/20ba03f.../megatron/core/ssm/mamba_context_parallel.py) 后，**核心不确定点**：
+
+| 问题 | 现状 | 待确认 |
+|---|---|---|
+| GDN forward 输入约定 | 单测显示 SBH `[S/cp, B, H]` | mbridge 在 embedding 后转 BSH→SBH？还是 caller 要预切？ |
+| GPTModel 是否内部做 CP split | `embedding(input_ids=...)` 直接喂 caller 给的 shape | 看起来不做，需 caller 预切 input_ids |
+| RoPE 是否需要 cp_group | `rotary_pos_emb(..., cp_group=packed_seq_params.cp_group)` | **必须**传 `packed_seq_params` 含 cp_group，BSHD 也是 |
+| 输出形状 | 单测输出仍是 `S/cp` 长度 | last PP stage logits 需 caller all-gather 回完整 S |
+
+**Task 5 实现选项**：
+
+A. **Caller-managed**（保守，类比现有 THD 路径）
+- preprocess: `[B, S, ...]` → `[B, S/cp, ...]` zigzag split
+- 构造 `PackedSeqParams(qkv_format="bshd", cp_group=...)` 传给 model.forward
+- postprocess: `[B, S/cp, V]` all-gather across cp → `[B, S, V]`
+- 工作量: ~100 行新代码 + 单测
+
+B. **Model-managed**（乐观）
+- 假设 mbridge / Megatron GPTModel 内部已经处理 BSHD CP split/gather
+- AReaL 仅传 `[B, S]` 给 model，输出已是 `[B, S, V]`
+- 风险: 实测可能 shape mismatch
+
+**决策路径**：等 v24 镜像 build 完后，**先跑一次 cp_size=2 实验**（无 Task 5 改动），看实际错误现象：
+- 若 model.forward shape error → 需要选项 A 实现
+- 若 model 跑通但 logits 错（数值 diff vs cp=1） → 需要 postprocess all-gather
+- 若 model 跑通且 logits 正确 → 选项 B 成立，Task 5 啥都不用做
+
+避免盲写代码改错方向。
+
 ### Task 3: 把 pg_collection.cp 通到模型构造
 
 **文件**:
