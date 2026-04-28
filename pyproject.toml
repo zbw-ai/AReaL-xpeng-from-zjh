@@ -156,7 +156,8 @@ kernels = [
     "kernels==0.12.2",
 ]
 megatron = [
-    "megatron-core==0.16.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # 0.17.0 (2026-04-16) 含 PR #2614/#2642 GDN BSHD-CP, 用于 Qwen3.5 长序列训练
+    "megatron-core==0.17.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@main; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 # Convenience extra for CUDA training packages (no inference backend)
