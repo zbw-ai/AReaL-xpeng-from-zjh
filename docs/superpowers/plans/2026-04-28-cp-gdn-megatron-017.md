@@ -1,292 +1,306 @@
-# Qwen3.5-35B-A3B Long-Context via Megatron 0.17 GDN-CP
+# Qwen3.5-35B-A3B 长序列 — Megatron 0.17 GDN-CP 升级方案
 
-**Branch**: `feat/cp-gdn-megatron-017`
+**分支**: `feat/cp-gdn-megatron-017`
 
-**Goal**: Unblock 32K context on Qwen3.5-35B-A3B by upgrading megatron-core 0.16.0 → 0.17.0 to pick up native GDN context-parallel support, then plumbing CP through mbridge + AReaL.
+**目标**: 通过升级 megatron-core 0.16.0 → 0.17.0 拿到原生 GDN context-parallel 支持，再把 CP 通路打通到 mbridge + AReaL，以支持 Qwen3.5-35B-A3B 跑到 32K 序列长度。
 
-**Trigger**: v22 (PP=4, 16K) and v22-pp8-r2 (PP=8 EP=4, 16K) both OOM at compute_logp. The 15.31 GB allocation is the LM-head logit buffer at the last PP stage; PP doesn't help (logit lives only on the last stage), TP=4 is blocked (`num_kv_heads=2`), so the only structural lever for 16K/32K is CP.
+**触发原因**: v22 (PP=4, 16K) 和 v22-pp8-r2 (PP=8 EP=4, 16K) 都在 compute_logp 阶段 OOM。15.31 GB 的失败分配是 last PP stage 的 LM-head logit buffer —— PP 层数加再多，logit 只在最后一个 stage，省不到这部分；TP=4 被 `num_kv_heads=2` 硬阻断；所以 16K/32K 唯一能动的结构性杠杆是 **CP**。
 
 ---
 
-## Day 1 Research Findings (2026-04-28)
+## Day 1 调研结果（2026-04-28）
 
-### Megatron upstream status
+### Megatron 上游状态
 
-Verified via NVIDIA/Megatron-LM PRs:
+通过 NVIDIA/Megatron-LM PR 实际验证：
 
-| PR | Title | Merged to dev | Merged to main | Target release | Notes |
+| PR | 标题 | 合 dev | 合 main | 目标 release | 备注 |
 |---|---|---|---|---|---|
-| [#2614](https://github.com/NVIDIA/Megatron-LM/pull/2614) | GDN context parallel | 2025-12-19 | — | 0.16 milestone | head-parallel via all-to-all (Mamba scheme) |
-| [#2642](https://github.com/NVIDIA/Megatron-LM/pull/2642) | #2614 main-branch port | — | **2026-04-13** | **0.17.0** | the actually-released CP code |
-| [#2644](https://github.com/NVIDIA/Megatron-LM/pull/2644) | GDN THD packed | 2026-04-07 | — | 0.16 milestone | Qwen3.5+THD has NaN; not useful |
+| [#2614](https://github.com/NVIDIA/Megatron-LM/pull/2614) | GDN context parallel | 2025-12-19 | — | 0.16 milestone | 走 head-parallel via all-to-all (Mamba 同思路) |
+| [#2642](https://github.com/NVIDIA/Megatron-LM/pull/2642) | #2614 main 分支版本 | — | **2026-04-13** | **0.17.0** | 我们要拿的 release 代码 |
+| [#2644](https://github.com/NVIDIA/Megatron-LM/pull/2644) | GDN THD packed | 2026-04-07 | — | 0.16 milestone | Qwen3.5+THD 有 NaN，不能用 |
 
-**Decision**: Use BSHD-CP (PR #2614/#2642). Avoid THD path (PR #2644) — it requires cuDNN ≥9.19 and has known numerical instability with Qwen3.5 fused attention.
+**决策**：走 BSHD-CP（PR #2614/#2642）路径。**避坑** PR #2644（THD）：要 cuDNN ≥9.19，且 Qwen3.5+fused attention+THD 已知数值不稳，作者建议临时切 flash backend。
 
-### Implementation surface (PR #2614/#2642)
+### PR #2614/#2642 的实现切面
 
-Only 3 files modified upstream:
-- `megatron/core/ssm/gated_delta_net.py` — CP logic embedded in module forward
-- `megatron/core/transformer/transformer_config.py` — config additions
-- `tests/unit_tests/ssm/test_gated_delta_net.py` — test refactor
+上游只改了 3 个文件：
+- `megatron/core/ssm/gated_delta_net.py` — CP 逻辑直接写进模块的 forward 里
+- `megatron/core/transformer/transformer_config.py` — 新增配置项
+- `tests/unit_tests/ssm/test_gated_delta_net.py` — 测试重构
 
-**Key API contract** (verified by reading raw 0.17 main GDN module):
-- GDN `__init__` reads `pg_collection: ProcessGroupCollection`, picks up `pg_collection.cp.size()`
-- All-to-all functions: `tensor_a2a_cp2hp` (CP → head-parallel), `tensor_a2a_hp2cp` (back to CP)
-- `sharded_state_dict` updated to include `'dp_cp_group'`
-- Caller activates via `--context-parallel-size N` (or equivalent config)
-- **No external wrapper required** — caller just sets CP size, GDN handles the rest internally
+**调用方契约**（直接读 0.17 main GDN 源码确认）：
+- GDN `__init__` 接 `pg_collection: ProcessGroupCollection`，从 `pg_collection.cp.size()` 拿 CP 大小
+- All-to-all 函数: `tensor_a2a_cp2hp`（CP → head-parallel）, `tensor_a2a_hp2cp`（再切回 CP）
+- `sharded_state_dict` 已更新，加了 `'dp_cp_group'`
+- 调用方启用方式: `--context-parallel-size N`（或等价配置）
+- **没有外部 wrapper** —— 调用方只设 CP 大小，GDN 内部自己处理切分/通信
 
-### PyPI version timeline
+### PyPI 版本时间线
 
-| Version | Released | Has GDN CP | Notes |
+| 版本 | 发布日 | 含 GDN CP | 备注 |
 |---|---|---|---|
-| 0.15.0 | 2025-12-18 | No | |
-| 0.15.3 | 2026-02-06 | No | |
-| 0.16.0 | 2026-02-26 | **No** (PR #2642 not yet merged) | **what we're using** |
-| 0.16.1 | 2026-03-20 | No (still pre-0.17) | |
-| **0.17.0** | **2026-04-16** | **YES** (PR #2642 merged 2026-04-13) | upgrade target |
+| 0.15.0 | 2025-12-18 | ❌ | |
+| 0.15.3 | 2026-02-06 | ❌ | |
+| 0.16.0 | 2026-02-26 | **❌** (PR #2642 还没合) | **当前在用** |
+| 0.16.1 | 2026-03-20 | ❌ (仍早于 0.17) | |
+| **0.17.0** | **2026-04-16** | **✅** (PR #2642 在 2026-04-13 合入) | **升级目标** |
 
-Only breaking change in 0.17.0: Python 3.10 deprecated. We're on 3.12 — OK.
+0.17.0 唯一 breaking change: Python 3.10 deprecated。我们用 3.12 — 不影响。
 
-### mbridge compatibility risks (the main unknown)
+### mbridge 兼容性（已重新调研，**风险大幅降低**）
 
-- **Latest mbridge**: 0.15.1 (2025-09-22). Released **before** megatron-core 0.16+, so no claim of compat with 0.17.
-- mbridge upstream README explicitly says it's in maintenance mode, redirects users to NVIDIA's [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) for advanced features.
-- mbridge `main` branch (post-release) has new `qwen3_5/`, `qwen3_omni_moe/` directories with conditionally-imported `Qwen3_5VlBridge`, `Qwen3_5MoeVlBridge` — but these are **not in 0.15.1**.
+**关键发现 — mbridge 升级路径清晰**：
 
-AReaL's existing Qwen3.5 patches (verified by grep):
-- [areal/models/mcore/registry.py:125-150](areal/models/mcore/registry.py) registers `Qwen3_5MoeForConditionalGeneration` and `Qwen3_5ForConditionalGeneration`
-- [areal/models/mcore/hf_save.py:204-624](areal/models/mcore/hf_save.py) has `_qwen3_5_moe_fallback_expert_export` workaround for mbridge returning empty expert names
-- [areal/engine/megatron_engine.py:1265,1340](areal/engine/megatron_engine.py) special path: `"qwen3_5" in model_type` triggers `_mbridge_convert_to_hf` (vanilla mbridge fallback)
-- [areal/engine/megatron_engine.py:283,346](areal/engine/megatron_engine.py) calls `disable_qwen3_5_incompatible_fusions` (5 fusions disabled)
+- **mbridge `main` 分支持续维护中**（最新 commit 2026-04-24）
+- mbridge main `pyproject.toml` 只要求 `megatron-core>=0.12.0`，开放上限，**会自动接受 0.17.0**
+- 最近 commit 明确做 Qwen3.5 + 新 mcore 适配：
+  - 2026-04-24: "adapt to new mcore for qwen35 mtp"
+  - 2026-04-23: "support mtp layer support for qwen3.5 series models"
+  - 2026-03-31: "remove deprecated async_tensor_model_parallel_allreduce in mcore"
+  - 2026-03-18: "support latest megatron that removes ModelType.encoder_and_decoder"
+- mbridge main 已有专门的 `qwen3_5/` 子目录 + `Qwen3_5VlBridge` / `Qwen3_5MoeVlBridge` 类（v0.15.1 release 没有）
+- mbridge config 里已有 `"cp_comm_type": "p2p"` 的设置，说明 CP 通信链路至少已有基础
 
-**Implication**: mbridge 0.15.1 partially handles Qwen3.5 (recognizes config, has expert name routing) but the pipeline is stitched together with AReaL workarounds. Whether it instantiates GDN with a properly-configured `pg_collection` (with `.cp` group) is **not yet verified**.
+**结论**：直接把 mbridge 从 v0.15.1 (Sep 2025) 升到 main 分支某个 commit 即可，**不需要切 NVIDIA Megatron-Bridge**（那是更大的重构）。
 
-### AReaL CP code path
+### AReaL 现有 Qwen3.5 适配代码
 
-[areal/engine/megatron_utils/packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py):
-- Current logic: split sequence by 2*CP zigzag using `cu_seqlens` (THD only)
-- BSHD branch (cu_seqlens=None): just calls `model(...)` directly, no preprocess, **no postprocess all-gather**
+通过 grep 验证：
+- [areal/models/mcore/registry.py:125-150](areal/models/mcore/registry.py) 注册了 `Qwen3_5MoeForConditionalGeneration` 和 `Qwen3_5ForConditionalGeneration`
+- [areal/models/mcore/hf_save.py:204-624](areal/models/mcore/hf_save.py) 有 `_qwen3_5_moe_fallback_expert_export` —— **专门处理 mbridge 0.15.1 expert 导出返回空的 bug**
+- [areal/engine/megatron_engine.py:1265,1340](areal/engine/megatron_engine.py) 走 `_mbridge_convert_to_hf` (vanilla mbridge fallback) 当 model_type 含 "qwen3_5"
+- [areal/engine/megatron_engine.py:283,346](areal/engine/megatron_engine.py) 调 `disable_qwen3_5_incompatible_fusions` 关 5 个 fusion
 
-[areal/engine/megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) hard-fails when `pad_to_maximum and cp_size > 1`:
+**风险**：现有 13 个 Qwen3.5 patches（含 `_qwen3_5_moe_fallback_expert_export` 等）是基于 mbridge 0.15.1 + megatron 0.16 的具体 bug 写的。**升级到 mbridge main + megatron 0.17 后，部分 patches 可能变得不必要（或反而冲突）** —— 需要 smoke test 时一一回归。
+
+### AReaL 自身的 CP 代码路径
+
+[areal/engine/megatron_utils/packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py)：
+- 当前逻辑：基于 `cu_seqlens` 做 2*CP zigzag 切分（**只支持 THD**）
+- BSHD 分支（cu_seqlens=None）：只是直接调 `model(...)`，前后处理都跳过 — **没有 all-gather**
+
+[areal/engine/megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) 在 `pad_to_maximum and cp_size > 1` 时硬抛错：
 ```python
 if self.config.pad_to_maximum and cp_size > 1:
     raise ValueError("pad_to_maximum=True is incompatible with context_parallel_size>1; ...")
 ```
 
-**This guard becomes obsolete once Megatron 0.17 GDN CP works** — but we still need to:
-1. Remove the guard
-2. Verify the BSHD postprocess all-gather (logits must be gathered across CP ranks before loss/logp computation)
+**Megatron 0.17 GDN CP 通后，这个 guard 就过时了** — 但仍需要：
+1. 删 guard
+2. 给 BSHD 路径补 logit 跨 CP all-gather（last stage 之前要把分散的序列收回完整）
 
-### Strategic conclusion
+### 战略结论
 
-Path forward is **Megatron upgrade + minor AReaL plumbing + mbridge compat verification**.
-**Worst-case fallback**: if mbridge 0.15.1 ⊥ megatron 0.17, switch Qwen3.5 path to NVIDIA Megatron-Bridge (larger refactor but more future-proof).
+路径 = **Megatron 升级 + mbridge 升级 + AReaL 少量改动**。
+
+**最坏情况退路**：mbridge main 在 35B 上回归不通过 → 再考虑切 NVIDIA Megatron-Bridge（但概率低，因为 mbridge 已明确做 Qwen3.5 + 新 mcore 适配）。
 
 ---
 
-## Architecture: 32K Memory Plan
+## 架构: 32K 内存预算
 
-| Layer | 16K (current OOM) | 16K + CP=2 | 32K + CP=4 |
+| 维度 | 16K (当前 OOM) | 16K + CP=2 | 32K + CP=4 |
 |---|---|---|---|
-| Per-rank seq tokens | 18432 | **9216** | 8192 |
-| LM-head logit alloc | 15.31 GB | **7.6 GB** | 6.8 GB |
-| compute_logp peak (actor + ref) | OOM (84 GB) | ~70 GB | ~70 GB |
-| Topology | d4p4t2 \| e8t1 (32 GPU) | **d2p4t2cp2 \| e8t1** (32 GPU) | **d1p4t2cp4 \| e8t1** (32 GPU) |
-| Net actor world | 32 | 32 (DP=2 → DP=2 still, CP added) | 32 (DP=1) |
+| 单 rank seq tokens | 18432 | **9216** | 8192 |
+| LM-head logit 申请 | 15.31 GB | **7.6 GB** | 6.8 GB |
+| compute_logp 总峰值 (actor + ref) | OOM (84 GB) | ~70 GB | ~70 GB |
+| 拓扑 | d4p4t2 \| e8t1 (32 GPU) | **d2p4t2c2 \| e8t1** (32 GPU) | **d1p4t2c4 \| e8t1** (32 GPU) |
+| Actor world | 32 | 32 (DP=2 → DP=2 不变, CP 加进来) | 32 (DP=1) |
 
-CP doesn't change actor GPU count — it eats DP. With CP=4 and DP=1, single-batch gradient noise increases; will need to scale `ppo_n_minibatches` to compensate.
+CP 不消耗额外 actor GPU —— 它是吃 DP。32K + CP=4 时 DP=1，单批梯度噪声升，需要靠 `ppo_n_minibatches` 调大补样本（256/128 = 1 sample/rank 极限情况）。
 
 ---
 
-## Tech Stack
+## 技术栈
 - megatron-core: 0.16.0 → **0.17.0**
-- mbridge: 0.15.1 (verify compat; fallback NVIDIA Megatron-Bridge)
-- AReaL: patch [packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py) + remove [megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) guard
+- mbridge: 0.15.1 → **main 分支某 commit (≥ 2026-04-24)**
+- AReaL: 改 [packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py) + 删 [megatron_engine.py:1643-1647](areal/engine/megatron_engine.py#L1643-L1647) guard
 
 ---
 
-## Tasks
+## 任务
 
-### Task 1: megatron-core 0.17 + mbridge 0.15.1 sanity check (no CP)
+### Task 1: megatron-core 0.17 + mbridge main smoke test (no CP)
 
-**Files:**
-- Modify: `pyproject.toml` (megatron-core==0.16.0 → 0.17.0)
-- Modify: `uv.lock` (regenerated)
-- Test: existing 0.8B yaml on this branch
+**文件**:
+- 改: `pyproject.toml` (megatron-core==0.16.0 → 0.17.0; mbridge 改成 git URL)
+- 改: `uv.lock` (重新 lock)
+- 测: 现有 0.8B yaml
 
-- [ ] **Step 1: Bump megatron-core in pyproject.toml**
+- [ ] **Step 1: 改 pyproject.toml**
 
 ```diff
 -megatron-core==0.16.0
 +megatron-core==0.17.0
+-mbridge==0.15.1
++mbridge @ git+https://github.com/ISEEKYAN/mbridge.git@<commit-hash-2026-04-24-or-later>
 ```
 
-- [ ] **Step 2: Lock-file refresh**
+- [ ] **Step 2: 重新 lock**
 
-Run: `uv sync --extra cuda --extra megatron`
-Expected: lock file updates; install succeeds with mbridge 0.15.1 + megatron 0.17.0; **if pip resolution fails** (e.g. mbridge pins megatron-core<0.17), fall to Task 2 fork path.
+跑: `uv sync --extra cuda --extra megatron`
+预期: lock 文件更新；mbridge main + megatron 0.17.0 共存安装成功；**若 pip 解析失败**（小概率，因为 mbridge main `>=0.12.0`）→ 走 Task 2。
 
-- [ ] **Step 3: Build container image with new pin**
+- [ ] **Step 3: 构造新 docker 镜像**
 
-Commit pyproject + lock file changes.
-Build new fuyao image: `areal-qwen3_5-megatron-v22` (next image tag in series).
+提交 pyproject + lock 文件改动。
+打 fuyao 镜像: `areal-qwen3_5-megatron-v22`（系列下一个 tag）。
 
-- [ ] **Step 4: Smoke test on 0.8B (no CP)**
+- [ ] **Step 4: 0.8B smoke test (不开 CP)**
 
-Submit existing `qwen3_5_0_8b_rlvr_vllm.yaml` job on this branch. **No yaml changes** — just verify Megatron 0.17 doesn't break the existing flow.
-- Expected pass: same throughput / output as v17, no init crash, no NaN in first train step
-- Expected risk: mbridge.AutoBridge.from_pretrained may fail if mbridge ↔ Megatron 0.17 ABI diverged
-- Output: pass/fail + any traceback
+提交现有 `qwen3_5_0_8b_rlvr_vllm.yaml` 任务，**yaml 不动**，只验证 megatron 0.17 + mbridge main 不破坏现有流程。
+- 预期通过：吞吐 / 输出 与 v17 持平，init 不崩，第一步 train 不出 NaN
+- 预期风险：若 AReaL 的 13 个 Qwen3.5 patches 与新版本冲突（如 `_qwen3_5_moe_fallback_expert_export` 在新 mbridge 已不需要、反而干扰），需逐一排查
+- 输出：通过 / 失败 + 任何 traceback
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add pyproject.toml uv.lock
-git commit -m "deps: upgrade megatron-core 0.16.0 → 0.17.0 (GDN CP support)"
+git commit -m "deps: bump megatron-core 0.17.0 + mbridge main (GDN CP 支持)"
 ```
 
-### Task 2: mbridge compat decision (only if Task 1 fails)
+### Task 2: mbridge 兼容性决策（仅 Task 1 失败才执行）
 
-**Triage**:
-- If failure is API rename / minor signature mismatch → patch mbridge in-tree (vendor a small mbridge fork)
-- If failure is fundamental (Qwen3.5 model construction broken) → switch to NVIDIA Megatron-Bridge for Qwen3.5 only (separate code path from non-Qwen3.5 models)
+**分流**：
+- 失败原因是 API 重命名 / 签名小改 → 在 AReaL 端打 patch（vendor 一份小补丁）
+- 失败原因是根本性的（Qwen3.5 模型构造彻底坏掉）→ 切 NVIDIA Megatron-Bridge **仅** 处理 Qwen3.5 路径（与其他模型解耦）
 
-This task is conditional and detailed only if Task 1 fails.
+只有 Task 1 失败才展开此任务的细节。
 
-### Task 3: Plumb pg_collection.cp through model construction
+### Task 3: 把 pg_collection.cp 通到模型构造
 
-**Files:**
-- Read: AReaL's mbridge AutoBridge.from_pretrained call site at [areal/engine/megatron_engine.py:245](areal/engine/megatron_engine.py#L245)
-- Read: mbridge's Qwen3.5 model factory (find which file in mbridge constructs the GDN-bearing TransformerLayer)
-- Possibly modify: AReaL or mbridge to propagate `pg_collection.cp = mpu.get_context_parallel_group()`
+**文件**:
+- 读: AReaL 的 mbridge AutoBridge.from_pretrained 调用点 [areal/engine/megatron_engine.py:245](areal/engine/megatron_engine.py#L245)
+- 读: mbridge 的 Qwen3.5 model factory（找出哪个文件构造含 GDN 的 TransformerLayer）
+- 可能改: AReaL 或 mbridge，把 `pg_collection.cp = mpu.get_context_parallel_group()` 接好
 
-- [ ] **Step 1: Trace pg_collection construction**
+- [ ] **Step 1: 跟踪 pg_collection 构造路径**
 
-Read AReaL's `MegatronEngine.initialize` from [areal/engine/megatron_engine.py:140-300](areal/engine/megatron_engine.py#L140-L300). Document where ProcessGroupCollection is built (likely from `mpu.get_*_group()` calls) and whether `cp` is included.
+读 [areal/engine/megatron_engine.py:140-300](areal/engine/megatron_engine.py#L140-L300) 的 `MegatronEngine.initialize`，记录 ProcessGroupCollection 在哪儿构造（很可能从 `mpu.get_*_group()` 拼），有没有把 `cp` 也包进去。
 
-- [ ] **Step 2: If cp group not propagated, add it**
+- [ ] **Step 2: 若 cp group 没接好，补上**
 
-Patch the construction site to set `pg_collection.cp = mpu.get_context_parallel_group()` before passing to mbridge.
+在构造点设 `pg_collection.cp = mpu.get_context_parallel_group()`，再传给 mbridge。
 
-- [ ] **Step 3: Verify by debug-print**
+- [ ] **Step 3: debug 打印验证**
 
-Add temporary log inside GDN module init (via Megatron source patch) to confirm `pg_collection.cp.size()` equals YAML's `context_parallel_size`. Remove after verification.
+在 GDN 模块 init 加临时 log（patch 一行 megatron 源码），确认 `pg_collection.cp.size()` == YAML 里的 `context_parallel_size`。验证完移除。
 
-### Task 4: Remove BSHD-CP fail-fast guard
+### Task 4: 删 BSHD-CP fail-fast guard
 
-**Files:**
-- Modify: [areal/engine/megatron_engine.py:1640-1647](areal/engine/megatron_engine.py#L1640-L1647)
+**文件**:
+- 改: [areal/engine/megatron_engine.py:1640-1647](areal/engine/megatron_engine.py#L1640-L1647)
 
-- [ ] **Step 1: Replace guard with a comment + version check**
+- [ ] **Step 1: 把 guard 换成注释 + 版本说明**
 
 ```python
-# Megatron 0.17+ supports BSHD CP for GDN (PR #2614/#2642).
-# The earlier fail-fast (pad_to_maximum + cp_size > 1) is now obsolete.
-# AReaL's packed_context_parallel_forward BSHD branch passes through the
-# Megatron model directly; GDN's internal CP all-to-all handles the
-# sequence shard transparently.
+# Megatron 0.17+ 原生支持 GDN BSHD CP (PR #2614/#2642)。
+# 旧的 fail-fast (pad_to_maximum + cp_size > 1) 已过时。
+# AReaL 的 packed_context_parallel_forward BSHD 分支直接调 Megatron 模型；
+# GDN 内部的 CP all-to-all 处理 seq shard。
 ```
 
 - [ ] **Step 2: Commit**
 
 ```bash
-git commit -m "feat(megatron): allow CP with pad_to_maximum (Megatron 0.17 GDN CP)"
+git commit -m "feat(megatron): 允许 CP 与 pad_to_maximum 共存 (Megatron 0.17 GDN CP)"
 ```
 
-### Task 5: Fix BSHD postprocess to all-gather logits across CP
+### Task 5: 给 BSHD 后处理补 logit 跨 CP all-gather
 
-**Files:**
-- Modify: [areal/engine/megatron_utils/packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py)
+**文件**:
+- 改: [areal/engine/megatron_utils/packed_context_parallel.py](areal/engine/megatron_utils/packed_context_parallel.py)
 
-- [ ] **Step 1: Locate BSHD output handling**
+- [ ] **Step 1: 定位 BSHD 输出处理**
 
-In `postprocess_packed_seqs_context_parallel`, current logic at [packed_context_parallel.py:80-81](areal/engine/megatron_utils/packed_context_parallel.py#L80-L81):
+`postprocess_packed_seqs_context_parallel` 当前 [packed_context_parallel.py:80-81](areal/engine/megatron_utils/packed_context_parallel.py#L80-L81):
 ```python
 if cp_size <= 1 or cu_seqlens is None:
     return output.squeeze(0)
 ```
-This skips all-gather for BSHD + CP > 1, which is wrong post Megatron 0.17.
+对 BSHD + CP > 1 直接跳过 all-gather —— 在 Megatron 0.17 之后这是错的。
 
-- [ ] **Step 2: Add BSHD CP postprocess**
+- [ ] **Step 2: 加 BSHD CP 后处理**
 
-When `cp_size > 1` and `cu_seqlens is None`:
-- Output shape on each rank is `[B, S/cp_size, ...]` after GDN's internal CP processing
-- Need `dist.all_gather` across CP group + `torch.cat(dim=1)` to reconstruct `[B, S, ...]`
-- (Alternative: rely on Megatron's built-in `gather_from_context_parallel_region` if applicable to non-pipeline-last stages)
+当 `cp_size > 1` 且 `cu_seqlens is None`:
+- 每个 rank 输出 shape `[B, S/cp_size, ...]`（经过 GDN 内部 CP 处理后）
+- 用 `dist.all_gather` 跨 CP group + `torch.cat(dim=1)` 拼回 `[B, S, ...]`
+- (备选: 用 Megatron 内置的 `gather_from_context_parallel_region`，对 non-pipeline-last stages 视情况)
 
-- [ ] **Step 3: Test on 0.8B (cp_size=2, pad_to_maximum=true)**
+- [ ] **Step 3: 0.8B 验证 (cp_size=2, pad_to_maximum=true)**
 
-Add a unit test that compares `cp_size=1` output vs `cp_size=2` output for the same input — must match within bf16 tolerance.
+加单测 — 同一输入，`cp_size=1` 的输出和 `cp_size=2` 的输出在 bf16 容差内必须一致。
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git commit -m "fix(megatron): BSHD CP postprocess all-gather for Megatron 0.17 GDN CP"
+git commit -m "fix(megatron): BSHD CP 后处理 all-gather (Megatron 0.17 GDN CP)"
 ```
 
-### Task 6: 0.8B numerical validation
+### Task 6: 0.8B 数值一致性验证
 
-**Files:**
-- Create: `tests/test_qwen3_5_cp_correctness.py`
+**文件**:
+- 创建: `tests/test_qwen3_5_cp_correctness.py`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: 写失败的 test**
 
 ```python
 def test_cp2_matches_cp1_logits():
-    # Run forward with cp_size=1 and cp_size=2 on same inputs
-    # Assert max abs diff < 1e-2 (bf16) for logits
+    # 用同样输入分别跑 cp_size=1 和 cp_size=2
+    # 断言 logits 最大绝对差 < 1e-2 (bf16 容差)
 ```
 
-- [ ] **Step 2: Run on 8 GPU 0.8B job (one node, TP=2 CP=2)**
+- [ ] **Step 2: 8 GPU 0.8B 任务跑 (单节点, TP=2 CP=2)**
 
-If correctness fails → debug post-process gather logic.
+如果数值不过 → 调试后处理 gather 逻辑。
 
-### Task 7: 35B 16K + CP=2 (memory validation)
+### Task 7: 35B 16K + CP=2 (内存验证)
 
-**Files:**
-- Create: `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq16k_cp2.yaml`
+**文件**:
+- 创建: `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq16k_cp2.yaml`
 
-- [ ] **Step 1: Write yaml**
+- [ ] **Step 1: 写 yaml**
 
 Backend: `megatron:(attn:d2p4t2c2|ffn:e8t1)` (DP=2 PP=4 TP=2 CP=2; ffn ep*tp*pp=32 ✓)
 
-- [ ] **Step 2: Deploy and verify**
+- [ ] **Step 2: 提交任务并验证**
 
-- compute_logp passes (no OOM at LM head)
-- actor peak < 60 GB; ref onload + activation < 80 GB total
+- compute_logp 通过（LM head 不再 OOM）
+- actor 峰值 < 60 GB; ref onload + activation 总和 < 80 GB
 
-### Task 8: 35B 32K + CP=4 (target)
+### Task 8: 35B 32K + CP=4 (终极目标)
 
-**Files:**
-- Create: `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq32k_cp4.yaml`
+**文件**:
+- 创建: `fuyao_examples/math/qwen3_5_35b_a3b_rlvr_vllm_6node_seq32k_cp4.yaml`
 
 Backend: `(attn:d1p4t2c4|ffn:e8t1)` (DP=1 PP=4 TP=2 CP=4)
-- [ ] Bump `max_new_tokens: 16384 → 32768`, `max_tokens: 18432 → 34816`
-- [ ] Validate end-to-end run
+- [ ] 改 `max_new_tokens: 16384 → 32768`, `max_tokens: 18432 → 34816`
+- [ ] 端到端跑通
 
 ---
 
-## Risk Register
+## 风险登记
 
-| Risk | Likelihood | Impact | Mitigation |
+| 风险 | 概率 | 影响 | 缓解 |
 |---|---|---|---|
-| mbridge 0.15.1 ⊥ megatron 0.17 ABI | High | Block Task 1 | Switch to NVIDIA Megatron-Bridge for Qwen3.5 only |
-| pg_collection.cp not plumbed by mbridge | Medium | Block Task 3 | Patch AReaL to inject cp group post-construction |
-| BSHD CP all-gather has subtle order bug | Medium | Wrong logits at training time | Numerical test in Task 6 must catch |
-| Qwen3.5 GDN CP merged but disabled by default | Low | Soft fail (no speedup) | Verify via Megatron debug print |
-| AReaL's 13 Qwen3.5 patches conflict with 0.17 | Medium | Various crashes | Re-validate with smoke test in Task 1 Step 4 |
+| mbridge main 有 ABI 变化与 AReaL Qwen3.5 patches 冲突 | 中 | 阻塞 Task 1 | smoke test 时逐一排查；可能要删过时 patches |
+| `pg_collection.cp` 没被 mbridge 构造时通进去 | 中 | 阻塞 Task 3 | 在 AReaL 端 inject cp group |
+| BSHD CP all-gather 顺序有微妙 bug | 中 | 训练时 logits 错 | Task 6 数值测必须抓出来 |
+| Qwen3.5 GDN CP 合了但默认关闭 | 低 | 没 speedup（但不报错） | 通过 Megatron debug print 确认 |
+| AReaL 的 13 个 Qwen3.5 patches 在 0.17 失效 | 中 | 各种 crash | Task 1 Step 4 smoke test 兜底 |
 
 ---
 
-## Self-Review
+## 自检
 
-- [x] Spec coverage: Tasks 1-8 cover upgrade, plumbing, correctness, memory validation, scaling.
-- [x] Placeholder scan: No TBD/TODO; conditional task (Task 2) flagged.
-- [x] Type consistency: pg_collection, cp_size used consistently; backend strings follow existing AReaL syntax `(attn:dXpYtZcN|ffn:eMtK)`.
+- [x] Spec 覆盖: Task 1-8 覆盖升级、通路、正确性、内存验证、扩展。
+- [x] 占位符扫描: 没有 TBD/TODO；Task 2 是条件性任务，已标。
+- [x] 类型一致: pg_collection, cp_size 用法一致；后端字符串遵循 AReaL 现有语法 `(attn:dXpYtZcN|ffn:eMtK)`。
 
-## Execution
+## 执行
 
-Tasks 1-2 are sequential (env setup). Task 3 depends on Task 1 success. Tasks 4-5 are independent. Task 6 depends on 4-5. Tasks 7-8 depend on 6.
+Task 1-2 串行（环境准备）。Task 3 依赖 Task 1。Task 4-5 独立。Task 6 依赖 4-5。Task 7-8 依赖 6。
 
-This branch is independent of `feat/weight-update-bucket` — both can advance in parallel and merge to `main` separately.
+本分支与 `feat/weight-update-bucket` 互不影响 — 两条线可以并行推进，分别合 `main`。
