@@ -1637,14 +1637,16 @@ class MegatronEngine(TrainEngine):
         # get_rope_index (matches veRL's VL BSHD path). We keep the 2D
         # [B, S] position_ids in the data pipeline for bookkeeping only;
         # it is not consumed by the model forward.
-        # packed_context_parallel_forward only runs CP split when cu_seqlens
-        # is not None; pad_to_maximum sets it to None so CP is silently bypassed.
-        # Fail fast rather than produce wrong logits.
-        if self.config.pad_to_maximum and cp_size > 1:
-            raise ValueError(
-                "pad_to_maximum=True is incompatible with context_parallel_size>1; "
-                "CP split logic in packed_context_parallel_forward requires cu_seqlens."
-            )
+        #
+        # CP under pad_to_maximum (BSHD format):
+        # Megatron-LM PR #2614/#2642 (commit 20ba03f, in dev/0.18+) added
+        # native GDN context-parallel that operates on BSHD inputs via
+        # head-parallel all-to-all (see megatron/core/ssm/gated_delta_net.py).
+        # The earlier fail-fast (`pad_to_maximum + cp_size > 1`) guarded
+        # against silent bypass when GDN had no CP support; with the new
+        # backend it is no longer necessary. AReaL still needs to do BSHD
+        # zigzag split before model forward and gather logits across CP at
+        # the last pipeline stage — see packed_context_parallel_forward.
         # Split the input into micro-batches
         # NOTE: Here we use 2*pp_size in forward to align logprob precision
         # TODO: Performance check
