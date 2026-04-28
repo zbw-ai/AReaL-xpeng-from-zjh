@@ -58,31 +58,11 @@ RUN pip uninstall -y megatron-core mbridge \
 # Safe because we force overlap_grad_reduce=False / overlap_param_gather=False
 # in our recipes (handle is None either way).
 # ---------------------------------------------------------------------------
-RUN python3 - <<'PY'
-import os, sys
-import megatron.core.distributed.param_and_grad_buffer as pgb_mod
-target = pgb_mod.__file__
-with open(target) as f:
-    src = f.read()
-if "PATCHED_FOR_NCCL_COALESCING_BUG" in src:
-    print(f"[OK] Patch already applied at {target}")
-    sys.exit(0)
-needle = "from torch.distributed import _coalescing_manager"
-if needle not in src:
-    print(f"[FAIL] Cannot find import in {target}", file=sys.stderr)
-    sys.exit(1)
-replacement = (
-    "from torch.distributed import _coalescing_manager as _orig_coalescing_manager  # noqa: F401  PATCHED_FOR_NCCL_COALESCING_BUG\n"
-    "from contextlib import nullcontext as _nullctx\n"
-    "def _coalescing_manager(*_args, **_kwargs):\n"
-    "    # PATCHED: NCCL backend lacks reduce_scatter_tensor_coalesced / allgather_into_tensor_coalesced.\n"
-    "    # Bypass with nullcontext so per-bucket NCCL ops run individually.\n"
-    "    return _nullctx()\n"
-)
-with open(target, "w") as f:
-    f.write(src.replace(needle, replacement, 1))
-print(f"[OK] Patched {target}")
-PY
+# Note: heredoc syntax (RUN python3 - <<'PY') is NOT supported by fuyao's
+# Docker builder — it parses lines inside heredoc as Docker instructions.
+# Use COPY + RUN with a standalone .py file instead.
+COPY fuyao_examples/patch_megatron_coalescing.py /tmp/patch_megatron_coalescing.py
+RUN python3 /tmp/patch_megatron_coalescing.py
 
 # ---------------------------------------------------------------------------
 # 3. Build-time verification: fail fast if any of the upgrades did not stick.
