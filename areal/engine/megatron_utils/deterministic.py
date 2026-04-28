@@ -44,6 +44,35 @@ def disable_qwen3_5_incompatible_fusions(model_config):
         "for Qwen3.5 compatibility."
     )
 
+    # Megatron-LM 0.18 dev (commit 20ba03f) transformer_layer.py:314-320 forwards
+    # `cp_comm_type` to attention's build_module when `cp_size > 1`. This was
+    # designed for standard self-attention's CP comm patterns, but Qwen3.5 uses
+    # GatedDeltaNet (`experimental_attention_variant="gated_delta_net"`), and
+    # GatedDeltaNet.__init__ does NOT accept `cp_comm_type` kwarg → TypeError.
+    #
+    # Mbridge sets `cp_comm_type="p2p"` unconditionally in _build_config; we have
+    # to suppress it here so that Megatron's `config.cp_comm_type is not None`
+    # check returns False and the kwarg is not forwarded to GDN.
+    #
+    # This is safe because: (a) cp_size=1 path doesn't read this field; (b) GDN
+    # uses its own all-to-all (cp2hp/hp2cp) pattern, not config.cp_comm_type.
+    if (
+        getattr(model_config, "experimental_attention_variant", None) == "gated_delta_net"
+        and getattr(model_config, "cp_comm_type", None) is not None
+    ):
+        before_cp = model_config.cp_comm_type
+        model_config.cp_comm_type = None
+        print(
+            f"[disable_qwen3_5_incompatible_fusions] cp_comm_type was={before_cp}, "
+            f"now None (GDN attention does not accept cp_comm_type kwarg).",
+            flush=True,
+        )
+        logger.info(
+            "Cleared cp_comm_type (was %r) — Qwen3.5 GDN attention does not "
+            "accept cp_comm_type kwarg via Megatron's transformer_layer.",
+            before_cp,
+        )
+
 
 def set_deterministic_algorithms(model_config):
     """
