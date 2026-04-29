@@ -62,6 +62,8 @@ from areal.engine.megatron_utils.megatron import (
     remove_padding,
 )
 from areal.engine.megatron_utils.packed_context_parallel import (
+    bshd_cp_zigzag_gather,
+    bshd_cp_zigzag_split,
     packed_context_parallel_forward,
 )
 from areal.engine.megatron_utils.pipeline_parallel import (
@@ -692,10 +694,15 @@ class MegatronEngine(TrainEngine):
                 )
                 # pad_to_maximum: padded_mb was aligned to tp_size along seq dim.
                 # Trim output back to orig_mb's seq dim so shapes match labels.
+                # Under cp_size>1 the output is already cp-split [B, padded_s/cp, V];
+                # _compute_forward_result / _compute_logprobs_and_loss will handle
+                # the cp-aligned label split + scalar logp gather + final trim.
                 if self.config.pad_to_maximum:
-                    orig_s = mb_input.orig_mb["input_ids"].shape[1]
-                    if output.shape[1] > orig_s:
-                        output = output[:, :orig_s]
+                    cp_size = self.parallel_strategy.context_parallel_size
+                    if cp_size <= 1:
+                        orig_s = mb_input.orig_mb["input_ids"].shape[1]
+                        if output.shape[1] > orig_s:
+                            output = output[:, :orig_s]
             return output, functools.partial(_process_output, mb_input.orig_mb)
 
         forward_backward_func = get_forward_backward_func()
@@ -1787,8 +1794,17 @@ class MegatronEngine(TrainEngine):
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
+        # BSHD CP: see _compute_forward_result for rationale. Same pattern:
+        # split labels to cp-split shape, run vocab-parallel logp on cp-split
+        # logits, then all-gather scalar logp/entropy/vocab-stats to full [B, S].
+        cp_size = mpu.get_context_parallel_world_size()
         if not self.config.is_critic:
             if self.enable_tree_training:
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "Tree training with context_parallel_size > 1 is not "
+                        "supported yet (packed-tree CP path missing)."
+                    )
                 # Handle dummy trie (empty tree for DP synchronization)
                 # When trie has no sequences, return zero loss with grad connection
                 trie_node = inputs.get("trie_node")
@@ -1815,6 +1831,14 @@ class MegatronEngine(TrainEngine):
                 )
             else:
                 labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+                orig_s = labels.shape[1]
+                if cp_size > 1:
+                    target_full_s = output.shape[1] * cp_size
+                    if labels.shape[1] < target_full_s:
+                        labels = torch.nn.functional.pad(
+                            labels, (0, target_full_s - labels.shape[1]), value=0
+                        )
+                    labels = bshd_cp_zigzag_split(labels)
                 logprobs, entropy = gather_logprobs_entropy(
                     output,
                     labels,
@@ -1825,6 +1849,19 @@ class MegatronEngine(TrainEngine):
                 )
                 vocab_min_logits = output.detach().min(-1).values.float()
                 vocab_max_logits = output.detach().max(-1).values.float()
+                if cp_size > 1:
+                    # All-gather scalar tensors [B, padded_s/cp] -> [B, padded_s],
+                    # then trim to orig_s so loss_fn (which uses inputs["loss_mask"]
+                    # etc. at orig_s) lines up.
+                    logprobs = bshd_cp_zigzag_gather(logprobs)
+                    entropy = bshd_cp_zigzag_gather(entropy)
+                    vocab_min_logits = bshd_cp_zigzag_gather(vocab_min_logits)
+                    vocab_max_logits = bshd_cp_zigzag_gather(vocab_max_logits)
+                    if logprobs.shape[1] > orig_s:
+                        logprobs = logprobs[:, :orig_s]
+                        entropy = entropy[:, :orig_s]
+                        vocab_min_logits = vocab_min_logits[:, :orig_s]
+                        vocab_max_logits = vocab_max_logits[:, :orig_s]
             loss = loss_fn(
                 logprobs,
                 entropy,
@@ -1834,6 +1871,11 @@ class MegatronEngine(TrainEngine):
             )
         else:
             values = output.squeeze(-1)
+            if cp_size > 1:
+                values = bshd_cp_zigzag_gather(values)
+                orig_s = inputs["input_ids"].shape[1]
+                if values.shape[1] > orig_s:
+                    values = values[:, :orig_s]
             loss = loss_fn(values, inputs)
 
         loss_scale = loss_weight_fn(inputs) / total_loss_weight * loss_multiplier
@@ -1848,8 +1890,18 @@ class MegatronEngine(TrainEngine):
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
             )
+        # BSHD CP: model output is cp-split [B, S/cp, V/TP]. Compute logprobs on
+        # cp-split shape (per-token op, no cross-token dependency), then
+        # all-gather the SCALAR log-probs back to full [B, S]. Avoid
+        # all-gathering logits (would re-inflate buffer; caused 35B 16K OOM).
+        cp_size = mpu.get_context_parallel_world_size()
         if not self.config.is_critic:
             if self.enable_tree_training:
+                if cp_size > 1:
+                    raise NotImplementedError(
+                        "Tree training with context_parallel_size > 1 is not "
+                        "supported yet (packed-tree CP path missing)."
+                    )
                 logprobs = _gather_packed_tree_logprobs(
                     output,
                     inputs["trie_node"],
@@ -1861,6 +1913,19 @@ class MegatronEngine(TrainEngine):
                 )
                 return logprobs
             labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
+            orig_s = labels.shape[1]
+            if cp_size > 1:
+                # output is cp-split with seq length padded_s/cp. Pad labels
+                # up to padded_s so the zigzag split is well-defined, then
+                # split. Padded positions get label 0 — their logp is never
+                # used downstream (loss_mask zeros them out at the orig_s
+                # boundary).
+                target_full_s = output.shape[1] * cp_size
+                if labels.shape[1] < target_full_s:
+                    labels = torch.nn.functional.pad(
+                        labels, (0, target_full_s - labels.shape[1]), value=0
+                    )
+                labels = bshd_cp_zigzag_split(labels)
             logprobs = gather_logprobs(
                 output,
                 labels,
@@ -1869,9 +1934,19 @@ class MegatronEngine(TrainEngine):
                 if mpu.get_tensor_model_parallel_world_size() > 1
                 else None,
             )
+            if cp_size > 1:
+                # All-gather scalar logp [B, S/cp] -> [B, padded_s], trim to orig_s.
+                logprobs = bshd_cp_zigzag_gather(logprobs)
+                if logprobs.shape[1] > orig_s:
+                    logprobs = logprobs[:, :orig_s]
             return logprobs
         else:
             values = output.squeeze(-1)
+            if cp_size > 1:
+                values = bshd_cp_zigzag_gather(values)
+                orig_s = inputs["input_ids"].shape[1]
+                if values.shape[1] > orig_s:
+                    values = values[:, :orig_s]
             return values
 
 
