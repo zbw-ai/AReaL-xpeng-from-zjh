@@ -304,6 +304,38 @@ v27 step 3 stats：
 - 没有 NaN, 没有 shape mismatch
 - 已完成 3 个 train step + update_weights + rollout 完整循环
 
+### 4.2.1 为什么 8K cp=1 (跑通 42 GB) vs 16K cp=2 (OOM 72 GB) 显存差这么多？
+
+**理论上两者 per-rank seq 接近**：8K cp=1 = 8192/rank，16K cp=2 = 9216/rank（per-rank seq 只差 12%）。
+按理 onload 显存应该接近。但实测差 30+ GB，原因分解：
+
+#### 三个差异点叠加
+
+| 差异 | 估算贡献 | 备注 |
+|---|---|---|
+| **colocate offload bug 在 16K 上失效** | **+20 GB** | actor 期望 offload 后 ≈0 GB，实测残留 26 GB；8K 下 offload 干净 |
+| DP 减半让 optim state 加倍 | +3 GB | DP=4 → DP=2，distributed_optimizer 切分从 4 份变 2 份 |
+| per-rank seq 12% 增长 | +1 GB | 8192 → 9216，logits/activation 按比例 |
+| **合计** | **~24 GB** | 与实测 OOM 距离匹配 |
+
+#### 关键：v26-r2 OOM 时 actor **在 offload 状态**
+
+- v22 (16k cp=1) OOM 时 actor **onload** 60 GB（params + grad + optim + activation 都在 GPU）
+- v26-r2 (16k cp=2) OOM 时 actor **offload** 残留 26 GB（torch_memory_saver pause 但 grad/optim buffer 没归 0）+ ref onload 46 GB → 72 GB
+- **CP 切分本身工作完美**：v26 .exp buffer 申请从 15.31→7.66 GB（精确 2× 切半）。
+  瓶颈是 **colocate offload bug**，不是 CP 不工作。
+
+#### 验证：v27 (8K cp=2) 跑通 vs v26 (16K cp=2) OOM —— 同 cp=2/DP=2，仅 seq 不同
+
+```
+v27 8K cp=2  跑通: peak 39 GB  ← per-rank seq 4096, offload 工作正常
+v26 16K cp=2 OOM:  72 GB      ← per-rank seq 9216, offload 失败 (actor 残留 26 GB)
+```
+
+8K 下 buffer 小，PyTorch cache pool 在 offload 时清得干净。16K 下大 block 持有不释放（`torch_memory_saver.pause()` 只 pause 显式 cuda 分配，不能强制清 megatron 内部 allocator 持有的 grad/optim buffer）。
+
+→ **修 colocate offload bug 后，16K cp=2 应该能直接跑通**（理论 actor onload ~47 GB + ref offload 残留 ~5 GB = ~52 GB ≪ 80 GB）。
+
 ### 4.3 35B + 16K (CP 适配验证 ✓，撞 offload bug ✗)
 
 | 任务 | Backend | 状态 | 备注 |
