@@ -273,11 +273,79 @@ v26 (v1, 2026-04-29 早晨) 在 `vocab_parallel.py:140 normalized_logits.exp()` 
 
 0.8B 任务在方案 C 下跑通多个 step，PPO 循环稳定（recompute_logp → ref_logp → compute_advantages → ppo_update 闭环），无 NaN，无 shape mismatch — 与 v1 行为一致。后续等 stats 输出对比 mfu / loss 数值。
 
-### 待补
+### 35B 16K + cp=2 v26-r2 实测 (2026-04-29 11:42)
+
+**任务**: `bifrost-2026042910570501-zengbw1` (qwen3_5-35b-v26-16k-cp2-r2)
+**结果**: 仍 OOM, 但**问题转移**, 方案 C 在 actor 端**完美工作**。
+
+#### 显存对比（v22 no-CP vs v26-r2 方案 C）
+
+| 维度 | v22 (no CP) | v26-r2 (方案 C, cp=2) | 变化 |
+|---|---|---|---|
+| `.exp()` buffer 申请 | **15.31 GB** | **7.66 GB** | **-50% ✓** (cp=2 切半完美生效) |
+| Actor 进程占用 | 60.37 GB | **26.06 GB** | **-34 GB (-57%)** ✓ |
+| Ref 进程占用 | 8.61 GB | **46.72 GB** | **+38 GB ❌ 异常激增** |
+| 总尝试 | 84 GB | 80.4 GB | 仍 OOM 缺 0.4 GB |
+
+#### 方案 C actor 端验证 ✓
+
+预测：actor 60.59 → ~48-50 GB；实际：**60.37 → 26.06 GB**（比预测好得多，节省 34 GB 而非外推的 12 GB）。
+
+`.exp()` buffer 完美对应 cp=2 切半：15.31 → 7.66 GB（精确 2× 比例）。
+
+#### 新问题：Ref 进程 46.72 GB 异常
+
+OOM 报错原文：
+```
+File "/code/areal/utils/functional/vocab_parallel.py", line 140, in forward
+    exp_logits = normalized_logits.exp()
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.66 GiB.
+GPU 0 has a total capacity of 79.25 GiB of which 6.46 GiB is free.
+This process has 26.06 GiB memory in use.        ← actor (compute_logp 中)
+Process 1728204 has 46.72 GiB memory in use.     ← ref (邻居)
+Of the allocated memory 22.65 GiB is allocated by PyTorch
+```
+
+#### Ref 占 46 GB 的根因推测
+
+Ref backend 配置: `backend: ${actor.backend}` = `(attn:d2p4t2c2|ffn:e8t1)`。理论上 cp_size=2。
+
+35B + cp=2 + PP=4 + TP=2 + DP=2 = 32-way 切分预期：
+- Params per rank: 35B/32 ≈ 1.1B → bf16 ~2.2 GB
+- Activation per rank（forward only, no grad）: 几 GB
+- **理论总占用 < 15 GB**
+
+**但实际 46.72 GB**，对应**未切 CP** 的 activation 量：
+- 35B + PP=4 + TP=2 + DP=2 = 16-way → params/rank 4.4 GB
+- 16K seq full forward activation: ~40 GB（GDN attention + MoE alltoall buffer + per-layer hidden states）
+
+**怀疑路径**：
+1. **Ref engine cp_size 实际为 1**（mpu state 没共享给 ref，或 ref 创建独立的 ParallelStrategy）
+2. **Ref 没 offload**（colocate 模式下应在 actor compute_logp 时把 ref weight 放 CPU，但 ref 仍占 46 GB GPU）
+
+#### 下一步诊断
+
+1. 抓 ref engine init 阶段的 log（确认 ref 的 `pp_stage`、`cp_size` 是否 == 2）
+2. 看 `_init_context_and_model_parallel_group` 在 ref 上是否触发
+3. 验证 `enable_offload: true` 是否对 ref 生效（看 ref 的 IOStruct Memory-Usage 输出）
+
+如果 ref 真的没切 CP，可能需要：
+- (a) 显式给 ref 传 cp 配置（不依赖 ${actor.backend} 的字符串解析）
+- (b) 或者强制 ref engine 用同一 mpu group
+
+#### v26-r2 的部分胜利
+
+虽然仍 OOM，但**方案 C 验证成功**：
+- actor 端逻辑正确（buffer 减半）
+- 预期 32K + cp=4 路径仍可行（buffer → 1/4，actor 26→13 GB）
+- 关键瓶颈从 actor 转到 ref —— 这是新的、独立的问题
+
+### 测试矩阵
 
 | 测试 | 任务名 | 状态 | 关键指标 |
 |---|---|---|---|
 | 0.8B cp=2 regression | `bifrost-2026042910564500-zengbw1` | ✅ **通过 + 省显存 30%** | device 38→26.5 GB |
-| 35B 16K + cp=2 (v26-r2) | `bifrost-2026042910570501-zengbw1` | ⏳ 关键验证 | actor < 80 GB / compute_logp 通过 |
+| 35B 16K + cp=2 (v26-r2) | `bifrost-2026042910570501-zengbw1` | ⚠️ **方案 C 成功但 ref 异常**, OOM 缺 0.4 GB | actor 26 GB ✓ / ref 46.72 GB ❌ |
 | 0.8B cp=1 vs cp=2 数值一致 | 未提交 | ⏳ 可选 | logp 最大绝对差 < 1e-2 |
-| 35B 32K + cp=4 | 未提交（v26 通过后） | ⏳ 终极目标 | compute_logp ≈ 1/4 of v22 |
+| 35B 32K + cp=4 | 未提交（先解 ref 异常） | ⏳ 终极目标 | compute_logp ≈ 1/4 of v22 |
+| **新增**: Ref cp_size 诊断 | 未提交 | ⏳ 关键 | ref 是否走 cp=2 路径 |
