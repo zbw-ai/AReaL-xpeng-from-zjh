@@ -306,32 +306,57 @@ Process 1728204 has 46.72 GiB memory in use.     ← ref (邻居)
 Of the allocated memory 22.65 GiB is allocated by PyTorch
 ```
 
-#### Ref 占 46 GB 的根因推测
+#### Ref 46 GB 的根因（修正初判）
 
-Ref backend 配置: `backend: ${actor.backend}` = `(attn:d2p4t2c2|ffn:e8t1)`。理论上 cp_size=2。
+**初步怀疑**（ref cp_size=1）**已被推翻**：
 
-35B + cp=2 + PP=4 + TP=2 + DP=2 = 32-way 切分预期：
-- Params per rank: 35B/32 ≈ 1.1B → bf16 ~2.2 GB
-- Activation per rank（forward only, no grad）: 几 GB
-- **理论总占用 < 15 GB**
+通过对比 0.8B v1 vs 方案 C 的 `ref logp` 阶段 IOStruct 数据：
 
-**但实际 46.72 GB**，对应**未切 CP** 的 activation 量：
-- 35B + PP=4 + TP=2 + DP=2 = 16-way → params/rank 4.4 GB
-- 16K seq full forward activation: ~40 GB（GDN attention + MoE alltoall buffer + per-layer hidden states）
+| 指标 | v1 ref logp | 方案 C ref logp | 节省 |
+|---|---|---|---|
+| allocated | 2.70 GB | 2.70 GB | 0（params 不变）|
+| reserved | 12.36 GB | **7.75 GB** | **-37%** |
+| device used | 38.01 GB | **26.52 GB** | **-30%** |
 
-**怀疑路径**：
-1. **Ref engine cp_size 实际为 1**（mpu state 没共享给 ref，或 ref 创建独立的 ParallelStrategy）
-2. **Ref 没 offload**（colocate 模式下应在 actor compute_logp 时把 ref weight 放 CPU，但 ref 仍占 46 GB GPU）
+→ 方案 C 在 ref 路径上也生效（reserved 减少 37%，对应 ref 的 logits/`.exp()` buffer 减小）。
+**说明 ref engine 也走 cp_size=2 路径**，没问题。
 
-#### 下一步诊断
+#### 真正根因：35B colocate 模式下 OOM 时序换了
 
-1. 抓 ref engine init 阶段的 log（确认 ref 的 `pp_stage`、`cp_size` 是否 == 2）
-2. 看 `_init_context_and_model_parallel_group` 在 ref 上是否触发
-3. 验证 `enable_offload: true` 是否对 ref 生效（看 ref 的 IOStruct Memory-Usage 输出）
+**v22 vs v26-r2 OOM 时刻对比**：
 
-如果 ref 真的没切 CP，可能需要：
-- (a) 显式给 ref 传 cp 配置（不依赖 ${actor.backend} 的字符串解析）
-- (b) 或者强制 ref engine 用同一 mpu group
+| 任务 | OOM 时刻 actor 状态 | OOM 时刻 ref 状态 |
+|---|---|---|
+| v22 (no CP) | **compute_logp 中**, onload 60 GB | offload 残留 8.61 GB |
+| v26-r2 (cp=2) | offload 残留 **26.06 GB** | **compute_logp 中**, onload **46.72 GB** |
+
+方案 C 让 actor compute_logp 顺利通过（申请 buffer 7.66 GB ≪ 之前 15.31 GB），程序**进入下一阶段 ref compute_logp**。
+
+35B + cp=2 + PP=4 + TP=2 + DP=2 = 32-way 下，ref forward 16K seq 真实占用 **~46 GB**：
+- ref params/rank ~2.2 GB（bf16）
+- 加 GDN + MoE alltoall buffer + per-layer hidden states + recompute checkpoint
+- 总 ~40-50 GB（与 v22 actor compute_logp 时的 activation 量级相当）
+
+这个 ref 占用本来就有，v22 时因为 actor 阶段 OOM 没机会跑到 ref 阶段所以没暴露。
+
+**真正瓶颈**：**actor offload 不彻底，残留 26 GB GPU**（params + grad/optim buffer + PyTorch cache）。Ref onload 后两个进程同 GPU 共占 72 GB，再申请 7.66 GB 触发 OOM。
+
+#### 0.8B vs 35B 行为差异原因
+
+| 维度 | 0.8B（不 OOM） | 35B（OOM） |
+|---|---|---|
+| Actor offload 后残留 | 极小（模型小）| 26 GB（params + grad/optim buffer）|
+| Ref onload 占用 | 小（2.70 GB allocated）| 46 GB（35B + 16K forward）|
+| Actor + ref 同时在 GPU | < 30 GB | **72 GB** ⚠️ |
+
+→ 35B 触发了"两个 colocate engine 同时占 GPU 不彻底释放"的瓶颈，0.8B 看不见。
+
+#### 下一步修复方向
+
+1. **彻底 offload actor**：在 ref onload 前调 `torch.cuda.empty_cache()` 释放 PyTorch 缓存
+2. **检查 actor offload 实现**：看 actor offload 时是否只 offload params，没释放 grad/optim buffer
+3. **更激进 CP**：cp=4 让 actor 和 ref 各自占用都减半（actor 26→13 GB, ref 46→23 GB）→ 总 36 GB ≪ 80 GB ✓
+4. **加节点拆 colocate**：actor 和 ref 不共享 GPU（资源成本高）
 
 #### v26-r2 的部分胜利
 
