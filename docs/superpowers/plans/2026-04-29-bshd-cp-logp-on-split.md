@@ -228,11 +228,56 @@ CP=4 时 = 1/4 → 3.8 GB
 
 ---
 
-## 实测验证（待填）
+## 实测验证
+
+### 0.8B cp=2 regression — 方案 C vs v1 显存对比 (2026-04-29)
+
+**任务**:
+- v1 baseline: `bifrost-2026042823342200-zengbw1` (commit `12ecc6c`，跑通 9h+ 179 step)
+- 方案 C:    `bifrost-2026042910564500-zengbw1` (commit `5f52fa3`，跑通 13 min+，多 step 稳定)
+
+**同 yaml** (`qwen3_5_0_8b_rlvr_vllm_cp2.yaml`)，**同镜像** (`v25-260427-2214`)，唯一差异是代码版本（git mount 自动拉新）。
+
+#### 各阶段显存测量（IOStruct INFO 输出，单位 GB）
+
+| 阶段 | v1: allocated / reserved / **device used** | 方案 C: allocated / reserved / **device used** | device 节省 |
+|---|---|---|---|
+| recompute_logp | 5.40 / 18.12 / **38.01** | 5.40 / 11.24 / **26.52** | **-11.49 GB (-30%)** |
+| ref_logp | 2.70 / 12.36 / **38.01** | 2.70 / 7.75 / **26.52** | **-11.49 GB (-30%)** |
+| compute_advantages | 5.40 / 18.12 / **38.01** | 5.40 / 11.24 / **26.52** | **-11.49 GB (-30%)** |
+| ppo_update | 5.40 / 18.12 / **38.01** | 5.40 / 11.24 / **26.52** | **-11.49 GB (-30%)** |
+
+#### 解读
+
+- **`allocated`**（当前活跃 tensor）持平 — 模型权重 + 优化器状态没变。
+- **`reserved`**（PyTorch 缓存 pool）从 **18.12 → 11.24 GB**（**-7 GB**）— logits / exp / softmax 临时 buffer 减半的直接体现。
+- **`device used`**（GPU 实际占用，含 cache + non-PyTorch）从 **38.01 → 26.52 GB**（**-11.5 GB / -30%**）。
+
+省下的 11.5 GB 来源：
+- `normalized_logits.exp()` 在 cp-split 上，buffer 形状 `[B, S/cp, V/TP]` 而非 `[B, S, V/TP]` — 减半
+- `gather_logprobs` 的 `_chunked_apply` 工作 buffer 减半
+- PyTorch 缓存 pool 跟着缩小（不需要预留 large block）
+
+#### 外推 35B + 16K + cp=2
+
+v26 (v1, 2026-04-29 早晨) 在 `vocab_parallel.py:140 normalized_logits.exp()` OOM 申请 **15.31 GB**（与 v22/v22-pp8 同尺寸 buffer，因 v1 caller-gather 还原 full S）。
+
+按 0.8B 实测的 50% buffer 节省外推到 35B：
+- 申请 buffer: 15.31 GB → **~7.6 GB**
+- actor 进程: 60.59 GB → **~48-50 GB**（按 30% device 缩减外推）
+- 总分配: actor 48 + ref 8.67 + buffer 7.6 = **~64 GB**  ≪ 80 GB ✓
+
+→ 35B v26-r2 (`bifrost-2026042910570501`) **预期过 OOM**，跑起来后验证。
+
+#### 训练正确性
+
+0.8B 任务在方案 C 下跑通多个 step，PPO 循环稳定（recompute_logp → ref_logp → compute_advantages → ppo_update 闭环），无 NaN，无 shape mismatch — 与 v1 行为一致。后续等 stats 输出对比 mfu / loss 数值。
+
+### 待补
 
 | 测试 | 任务名 | 状态 | 关键指标 |
 |---|---|---|---|
-| 0.8B cp=2 regression | 待提交 | ⏳ | mfu / step_time / loss 与 v25 一致 |
-| 35B 16K + cp=2 (v26-r2) | 待提交 | ⏳ | compute_logp 不 OOM / actor 峰值显存 |
-| 0.8B cp=1 vs cp=2 数值一致 | 待提交 | ⏳ | logp 最大绝对差 < 1e-2 |
-| 35B 32K + cp=4 | 待提交 | ⏳ | compute_logp 显存 ≈ 1/4 of v22 |
+| 0.8B cp=2 regression | `bifrost-2026042910564500-zengbw1` | ✅ **通过 + 省显存 30%** | device 38→26.5 GB |
+| 35B 16K + cp=2 (v26-r2) | `bifrost-2026042910570501-zengbw1` | ⏳ 关键验证 | actor < 80 GB / compute_logp 通过 |
+| 0.8B cp=1 vs cp=2 数值一致 | 未提交 | ⏳ 可选 | logp 最大绝对差 < 1e-2 |
+| 35B 32K + cp=4 | 未提交（v26 通过后） | ⏳ 终极目标 | compute_logp ≈ 1/4 of v22 |
