@@ -262,7 +262,49 @@ return logprobs
 
 **ref_logp 阶段** 也 30% 节省（reserved 12.36 → 7.75 GB）→ 证明方案 C 在 ref 路径上也生效。
 
-### 4.2 35B（CP 适配验证 ✓，撞 offload bug ✗）
+### 4.2 35B + 8K 净对照 (v21 cp=1 vs v27 cp=2) — **CP 切分功能纯净验证 ✓**
+
+为避开 35B 16K + cp=2 的 colocate offload bug 干扰，在 8K 下做单一变量对照。
+v27 yaml 与 v21 完全相同，仅 backend `(attn:d4p4t2|ffn:e8t1)` → `(attn:d2p4t2c2|ffn:e8t1)` + `ppo_n_minibatches` 32→64 (DP=4→2 补偿)。
+
+#### 任务
+
+- **v21 cp=1**: `bifrost-2026042715145701-zengbw1`
+- **v27 cp=2**: `bifrost-2026042913193501-zengbw1` (跑通 step 3+, mfu=0.0314)
+
+#### 各阶段 IOStruct device used (GB) 实测对比
+
+| 阶段 | v21 cp=1 | v27 cp=2 | 节省 |
+|---|---|---|---|
+| after onload model | 39.33 | **38.73** | -0.60 |
+| recompute_logp | 39.33 | **38.75** | -0.58 |
+| ref_logp（峰值） | 42.06 | **39.25** | **-2.81 (-7%)** |
+| compute_advantages | 39.39 | **38.75** | -0.64 |
+| ppo_update | 39.39 | **38.75** | -0.64 |
+| **峰值** | **42.06** | **39.25** | **-2.81 (-7%)** |
+
+#### 节省比例与 seq 长度关系（CP 切的是 per-rank seq 相关 buffer）
+
+CP 节省主要在 logits / `.exp()` buffer：
+
+| 模型 + seq | logits buffer 估算 (bf16, 含 .exp 临时) | cp=2 节省 |
+|---|---|---|
+| 0.8B + 4K | ~3 GB (~10%) | -1.5 GB |
+| 35B + 8K | **~6 GB (~15%)** | **-3 GB ✓ 与实测吻合** |
+| 35B + 16K | ~13.5 GB (~25%) | -6.7 GB（v26 r2 实测申请 buffer 15.31→7.66 GB ✓）|
+| 35B + 32K | ~27 GB (~30%) | -13 GB（cp=4 → -20 GB）|
+
+→ **CP 适配数学上完全正确，节省比例与 seq 长度成正比**。8K 节省小是预期；32K 才是 CP 的主战场。
+
+#### 训练数值正确性 ✓
+
+v27 step 3 stats：
+- `behave_imp_weight/avg = 1.0002` (PPO importance ratio ≈ 1，正常)
+- `entropy/max = 5.75`，`behave_approx_kl/avg = -5.66e-04` (合理范围)
+- 没有 NaN, 没有 shape mismatch
+- 已完成 3 个 train step + update_weights + rollout 完整循环
+
+### 4.3 35B + 16K (CP 适配验证 ✓，撞 offload bug ✗)
 
 | 任务 | Backend | 状态 | 备注 |
 |---|---|---|---|
