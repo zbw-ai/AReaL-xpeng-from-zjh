@@ -1,0 +1,269 @@
+# Qwen3.5-35B-A3B Math RLVR — 6-node, batch=32 + seq=16K + CP=2 (v26)
+#
+# 基于 v22 OOM 路径分析 + v25 0.8B + cp=2 实测验证 (mfu=0.187, 9h+ 稳定)。
+#
+# v22 (PP=4 EP=8) OOM 现场:
+#   actor 60.37 GB + ref onload 8.61 GB + compute_logp activation 15.31 GB = 84 GB > 80 GB
+#   关键: 15.31 GB 是 last PP stage 的 LM head logits, PP=4→8 救不到 (logits 只在最后 stage)
+#
+# v22-pp8 (PP=8 EP=4) 也 OOM:
+#   PP=8 把 layer params/activation 折半, 但 logits 仍 15.31 GB (LM head 不变)
+#   actor 59.14 GB + ref 6.80 GB + 15.31 GB → 81 GB > 80 GB (差 1 GB)
+#
+# v26 (PP=4 EP=8 CP=2) 设计:
+#   CP=2 把 sequence 切一半 → per-rank seq tokens 18432/2 = 9216
+#   logits buffer: 15.31 GB / 2 ≈ 7.6 GB (核心修复)
+#   activation: cp=2 折半 → ~3-5 GB (compute_logp peak)
+#   预期 actor compute_logp peak: 9.35 + 7.6 + 8.6 + 7.6 ≈ 33 GB ≪ 80 GB
+#
+# CP 实现路径 (基于 v25 0.8B 实测验证, commits cd308de + 12ecc6c):
+#   - megatron-core@0f6fcb0 (含 PR #2614/#2644/#4230 完整 GDN CP)
+#   - mbridge@310e8fb (Qwen3.5 + 新 mcore 适配)
+#   - AReaL: BSHD CP postprocess all-gather + zigzag unshuffle
+#   - AReaL: 禁 MTP, 清 cp_comm_type (防御性)
+#   - dockerfile: _coalescing_manager → nullcontext (NCCL 兼容)
+#
+# 集群约束:
+#   actor 32 GPU: DP × CP × PP × TP = 2 × 2 × 4 × 2 = 32 ✓
+#   ffn ep × tp × pp = 8 × 1 × 4 = 32 ✓ (与 attn world 整除)
+#   expert_dp = 32/32 = 1
+#   ppo_n_minibatches: 256 samples / DP=2 / 2 sample/rank/mb = 64
+#     与 v22-pp8/v18-v21 的 2 sample/rank/mb 一致 (DP 减半 → minibatches 加倍)
+#
+# OOM 回退方案 (按递增):
+#   1. vllm.max_num_seqs: 32 → 16
+#   2. ppo_n_minibatches: 64 → 128 (1 sample/rank/mb)
+#   3. 切 cp=4: backend (attn:d1p4t2c4|ffn:e4t1) (DP=1, ep 减半)
+#
+# 与 v22 (PP=4 EP=8) 唯一差异:
+#   backend: (attn:d4p4t2|ffn:e8t1) → (attn:d2p4t2c2|ffn:e8t1)  ← 加 c2
+#   ppo_n_minibatches: 32 → 64 (DP 减半补偿)
+#
+# GPU layout:
+#   Actor (32 GPU): megatron:(attn:d2p4t2c2|ffn:e8t1)
+#   vLLM  (16 GPU): vllm:d8t2 (不变)
+#   Ref: colocated with actor
+
+experiment_name: ${oc.env:BIFROST_JOB_NAME,default}-qwen3_5-35b-a3b-seq16k-cp2
+trial_name: trial0
+
+seed: 42
+enable_offload: true   # 35B colocate 必需
+total_train_epochs: 10
+tokenizer_path: ${actor.path}
+
+cluster:
+  n_nodes: 6
+  n_gpus_per_node: 8
+  fileroot: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/files
+  name_resolve:
+    type: nfs
+    nfs_record_root: /dataset_rc_llmrl/zengbw1/areal_experiments/${experiment_name}/name_resolve
+
+scheduler:
+  type: local
+
+# ── Rollout (Inference) ──
+rollout:
+  backend: "vllm:d8t2"
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  setup_timeout: 1200.0
+  max_concurrent_rollouts: 32
+  queue_size: null
+  consumer_batch_size: ${train_dataset.batch_size}
+  max_head_offpolicyness: 2
+  enable_rollout_tracing: false
+  scheduling_spec: ${actor.scheduling_spec}
+  fileroot: ${cluster.fileroot}
+  tokenizer_path: ${tokenizer_path}
+  dump_to_file: true
+
+# ── Generation Config — 与 v22 完全一致 ──
+gconfig:
+  n_samples: 8
+  min_new_tokens: 0
+  max_new_tokens: 16384
+  max_tokens: 18432
+  greedy: false
+  temperature: 0.99
+  top_p: 0.99
+  top_k: 100
+
+eval_gconfig:
+  n_samples: 1
+  min_new_tokens: 0
+  max_new_tokens: 16384
+  max_tokens: 18432
+  greedy: false
+  temperature: 0.6
+  top_p: 1.0
+  top_k: -1
+
+# ── Actor (Training) ──
+actor:
+  backend: "megatron:(attn:d2p4t2c2|ffn:e8t1)"   # v26: 加 CP=2, DP 4→2
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: /dataset_rc_b1/models/Qwen3.5-35B-A3B
+  init_from_scratch: false
+  disable_dropout: true
+  gradient_checkpointing: true
+  dtype: bfloat16
+  grad_reduce_dtype: float32
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 18432
+    n_mbs_divisor: 1
+  pad_to_maximum: true        # Qwen3.5 GDN 强制 BSHD
+  optimizer:
+    type: adam
+    lr: 1.0e-6
+    weight_decay: 0.1
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1e-8
+    lr_scheduler_type: cosine
+    gradient_clipping: 1.0
+    warmup_steps_proportion: 0.01
+  megatron:
+    wrap_with_ddp: true
+    ddp:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false   # NCCL coalescing patch 要求
+      overlap_param_gather: false  # 同上
+      use_distributed_optimizer: true
+    use_deterministic_algorithms: true
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 1
+    moe_router_dtype: fp32
+    moe_token_dispatcher_type: alltoall
+  # ── PPO 超参 (与 8B benchmark / v22 一致) ──
+  eps_clip: 0.2
+  temperature: ${gconfig.temperature}
+  reward_scaling: 1.0
+  reward_bias: 0.0
+  kl_ctl: 0.001
+  # v26: ppo_n_minibatches 32 → 64 (DP 4→2 补偿, 保持 2 sample/rank/mb)
+  ppo_n_minibatches: 64
+  recompute_logprob: true
+  use_decoupled_loss: true
+  behave_imp_weight_cap: 2.0
+  behave_imp_weight_mode: token_mask
+  adv_norm:
+    mean_level: batch
+    std_level: batch
+  reward_norm:
+    mean_level: group
+    std_level: group
+    group_size: ${gconfig.n_samples}
+  # 35B 必需的 disk-mode (xccl 与 q||gate 不兼容)
+  weight_update_mode: disk
+  max_new_tokens: ${gconfig.max_new_tokens}
+  scheduling_spec:
+    - task_type: worker
+      port_count: 2
+      gpu: 1
+      mem: 32
+      cmd: python3 -m areal.infra.rpc.rpc_server
+      env_vars: {}
+
+# ── Reference Model — colocated ──
+ref:
+  backend: ${actor.backend}
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  path: ${actor.path}
+  init_from_scratch: false
+  disable_dropout: true
+  dtype: ${actor.dtype}
+  mb_spec:
+    n_mbs: 1
+    granularity: 1
+    max_tokens_per_mb: 18432
+    n_mbs_divisor: 1
+  pad_to_maximum: true
+  optimizer: null
+  scheduling_strategy:
+    type: colocation
+    target: actor
+  scheduling_spec: ${actor.scheduling_spec}
+
+# ── vLLM ──
+vllm:
+  model: ${actor.path}
+  seed: ${seed}
+  dtype: ${actor.dtype}
+  max_num_seqs: 32
+  max_model_len: 18432
+  gpu_memory_utilization: 0.68
+  enforce_eager: true
+
+# ── Datasets ──
+train_dataset:
+  batch_size: 32
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048
+  path: /workspace/lijl42@xiaopeng.com/datasets/hard_prompts/20251203_for_rl/data/deepmath_math_rule_20k.parquet
+  type: deepmath
+
+valid_dataset:
+  batch_size: 4
+  pin_memory: true
+  num_workers: 4
+  max_length: 2048
+  path: /workspace/lijl42@xiaopeng.com/data_process/20251205_rl_data/aime_2024_rule.parquet
+  type: aime_2024
+
+# ── Utilities ──
+saver:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 10000
+  freq_secs: null
+
+recover:
+  mode: disabled
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: null
+  freq_steps: null
+  freq_secs: null
+
+evaluator:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  freq_epochs: 1
+  freq_steps: 20
+  freq_secs: null
+
+stats_logger:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  wandb:
+    mode: disabled
+  swanlab:
+    mode: online
+    project: areal_train
+    name: ${experiment_name}-${trial_name}
+    api_key: ${oc.env:SWANLAB_API_KEY,}
+
+perf_tracer:
+  experiment_name: ${experiment_name}
+  trial_name: ${trial_name}
+  fileroot: ${cluster.fileroot}
+  enabled: false
+  save_interval: 1
+  profile_steps: []
+  session_tracer:
+    enabled: true
+    flush_threshold: 256
